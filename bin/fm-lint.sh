@@ -3,8 +3,9 @@
 #
 # Runs its file set with ShellCheck's default severity, extended analysis,
 # ambient configuration disabled, and one exact ShellCheck version. The
-# canonical verifier invokes this script with --full, so the rule set,
-# version, bounded execution, and diagnostics ordering cannot drift.
+# canonical verifier invokes this script with --full outside pull requests, or
+# with an explicit PR base ref in CI, so the rule set, version, bounded
+# execution, and diagnostics ordering cannot drift.
 # The explicit --fast mode is local-only and disables ShellCheck's extended
 # dataflow analysis while preserving ordinary shell lint checks. The canonical
 # verifier keeps full analysis over the context-independent canonical set.
@@ -17,8 +18,10 @@
 # With no explicit paths, the file set depends on context:
 #   - In CI (GITHUB_ACTIONS=true or CI=true), on the main branch, or when no
 #     merge-base against origin/main (or local main) can be found, it lints
-#     the full canonical set: bin/*.sh bin/backends/*.sh tests/*.sh. This is
-#     what CI always runs, so CI coverage never depends on a local diff.
+#     the full canonical set: bin/*.sh bin/backends/*.sh tests/*.sh, unless
+#     the caller explicitly supplies --base-ref for an exact pull-request
+#     base. This keeps PR work bounded while main remains the full-repository
+#     safety net.
 #   - Otherwise (an ordinary local branch with a real merge-base) it lints
 #     only the canonical-set files changed since that merge-base, including
 #     uncommitted local edits, via plain local `git diff` (no network, no
@@ -38,6 +41,7 @@
 # Usage:
 #   fm-lint.sh                         lint the context-selected file set (see above)
 #   fm-lint.sh --full                  lint the complete canonical file set
+#   fm-lint.sh --base-ref <git-ref>     lint canonical files changed since a resolved base
 #   fm-lint.sh --fast [path]...       local lint with extended analysis disabled
 #   fm-lint.sh <path>...               lint explicit roots with the same config
 #   fm-lint.sh --jobs <1|2> [path]...  override bounded worker count
@@ -76,7 +80,14 @@ fm_lint_worker() {  # <manifest> <output-dir> <shard-index>
     trap 'fm_lint_worker_stop; exit 129' HUP
     trap 'fm_lint_worker_stop; exit 130' INT
     trap 'fm_lint_worker_stop; exit 143' TERM
-    shellcheck_args=(--norc --external-sources)
+    shellcheck_args=(--norc)
+    if [ "${FM_LINT_INTERNAL_EXTERNAL_SOURCES:-1}" = 1 ]; then
+      shellcheck_args+=(--external-sources)
+    else
+      # These findings require source expansion to distinguish real defects
+      # from declarations and imports owned by another canonical root.
+      shellcheck_args+=(--exclude=SC1091 --exclude=SC2034 --exclude=SC2153 --exclude=SC2329)
+    fi
     if [ "${FM_LINT_INTERNAL_FAST:-0}" -eq 1 ]; then
       shellcheck_args+=(--extended-analysis=false)
     fi
@@ -127,6 +138,7 @@ JOBS=${FM_LINT_JOBS:-2}
 TELEMETRY=${FM_LINT_TELEMETRY:-}
 FAST=0
 FULL=0
+BASE_REF=
 ANALYSIS_MODE=full
 LIST_FILES=0
 while [ "$#" -gt 0 ]; do
@@ -156,6 +168,16 @@ while [ "$#" -gt 0 ]; do
       ;;
     --full)
       FULL=1
+      shift
+      ;;
+    --base-ref)
+      [ "$#" -ge 2 ] || { printf 'fm-lint.sh: --base-ref requires a git ref.\n' >&2; exit 2; }
+      BASE_REF=$2
+      shift 2
+      ;;
+    --base-ref=*)
+      BASE_REF=${1#*=}
+      [ -n "$BASE_REF" ] || { printf 'fm-lint.sh: --base-ref requires a git ref.\n' >&2; exit 2; }
       shift
       ;;
     --list-files)
@@ -222,22 +244,37 @@ fm_lint_is_canonical_root() {
 CHANGED_MODE=0
 EXPLICIT_PATHS=0
 if [ "$#" -gt 0 ]; then
-  [ "$FULL" -eq 0 ] || {
-    printf 'fm-lint.sh: --full does not accept explicit paths.\n' >&2
+  [ "$FULL" -eq 0 ] && [ -z "$BASE_REF" ] || {
+    printf 'fm-lint.sh: --full and --base-ref do not accept explicit paths.\n' >&2
     exit 2
   }
   EXPLICIT_PATHS=1
   ROOTS=("$@")
 else
   full_lint=1
-  if [ "$FULL" -eq 0 ] \
+  base_ref=
+  if [ -n "$BASE_REF" ]; then
+    if ! command -v git >/dev/null 2>&1 \
+      || ! git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+      || ! git rev-parse --verify -q "$BASE_REF" >/dev/null 2>&1; then
+        printf 'fm-lint.sh: --base-ref does not resolve to a local commit: %s\n' "$BASE_REF" >&2
+        exit 2
+    fi
+    base_ref=$BASE_REF
+  elif [ "$FULL" -eq 0 ] \
     && [ "${GITHUB_ACTIONS:-}" != true ] && [ "${CI:-}" != true ] \
     && command -v git >/dev/null 2>&1 \
     && git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     && [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" != main ]; then
     base_ref=$(fm_lint_changed_base_ref) || base_ref=
+  fi
+  if [ -n "$base_ref" ]; then
     merge_base=
     [ -z "$base_ref" ] || merge_base=$(git merge-base "$base_ref" HEAD 2>/dev/null) || merge_base=
+    if [ -n "$BASE_REF" ] && [ -z "$merge_base" ]; then
+      printf 'fm-lint.sh: --base-ref has no merge-base with HEAD: %s\n' "$BASE_REF" >&2
+      exit 2
+    fi
     [ -z "$merge_base" ] || full_lint=0
   fi
 
@@ -254,6 +291,13 @@ else
   fi
 fi
 ROOT_COUNT=${#ROOTS[@]}
+SOURCE_EXPANSION=1
+if [ "$CHANGED_MODE" -eq 1 ]; then
+  # A PR base ref deliberately checks changed roots directly. Following every
+  # sourced module here would re-expand a large PR into the whole repository;
+  # the full source-aware verification on main remains the safety net.
+  SOURCE_EXPANSION=0
+fi
 
 if [ "$LIST_FILES" -eq 1 ]; then
   [ "$#" -eq 0 ] || {
@@ -420,6 +464,7 @@ fm_lint_run_worker() {  # <worker-index>
       exec "$PERL_BIN" -e 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV or die "exec: $!"' \
         /usr/bin/time -lp -o "$timing" \
         env FM_LINT_INTERNAL=1 FM_LINT_INTERNAL_FAST="$FAST" FM_LINT_SHELLCHECK="$SHELLCHECK_BIN" \
+        FM_LINT_INTERNAL_EXTERNAL_SOURCES="$SOURCE_EXPANSION" \
         "${BASH:-bash}" "$SELF" --internal-worker "$manifest" "$OUTPUT_DIR" "$worker_index"
     else
       exec "$PERL_BIN" -e 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV or die "exec: $!"' \
@@ -431,6 +476,7 @@ fm_lint_run_worker() {  # <worker-index>
     [ -z "$TELEMETRY" ] || printf 'timing_unavailable=1\n' > "$timing"
     exec "$PERL_BIN" -e 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV or die "exec: $!"' \
       env FM_LINT_INTERNAL=1 FM_LINT_INTERNAL_FAST="$FAST" FM_LINT_SHELLCHECK="$SHELLCHECK_BIN" \
+      FM_LINT_INTERNAL_EXTERNAL_SOURCES="$SOURCE_EXPANSION" \
       "${BASH:-bash}" "$SELF" --internal-worker "$manifest" "$OUTPUT_DIR" "$worker_index"
   fi
 }

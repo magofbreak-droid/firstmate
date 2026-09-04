@@ -203,6 +203,9 @@ case "$*" in
   "rev-parse --verify -q origin/main")
     [ "${FM_TEST_GIT_HAS_ORIGIN_MAIN:-1}" = 1 ] && exit 0 || exit 1
     ;;
+  "rev-parse --verify -q "*)
+    exit 0
+    ;;
   "rev-parse --verify -q main")
     [ "${FM_TEST_GIT_HAS_MAIN:-1}" = 1 ] && exit 0 || exit 1
     ;;
@@ -250,6 +253,9 @@ fm_lint_stub_shellcheck() {
 if [ "\${1:-}" = --version ]; then
   printf 'ShellCheck - shell script analysis tool\nversion: 0.11.0\n'
   exit 0
+fi
+if [ -n "\${FM_TEST_OPTION_LOG:-}" ]; then
+  printf '%s\n' "\$*" > "\$FM_TEST_OPTION_LOG"
 fi
 mode=on
 while [ "\$#" -gt 0 ] && [ "\$1" != -- ]; do
@@ -392,6 +398,35 @@ test_ci_forces_full_lint_even_with_empty_diff() {
   [ "$(printf '%s\n' "$listed" | LC_ALL=C sort)" = "$expected" ] \
     || fail "CI=true did not force the full canonical file set"
   pass "fm-lint.sh forces a full lint in CI even when the local diff would be empty"
+}
+
+test_ci_base_ref_lints_changed_files() {
+  local tmp fakebin log options diff_file out target
+  tmp=$(fm_test_tmproot fm-lint-ci-base-ref)
+  fakebin=$(fm_fakebin "$tmp")
+  fm_lint_stub_git "$fakebin"
+  log="$tmp/shellcheck.log"
+  options="$tmp/shellcheck-options.log"
+  fm_lint_stub_shellcheck "$fakebin" "$log"
+  diff_file="$tmp/diff.nul"
+  target="bin/fm-install-shellcheck.sh"
+  fm_lint_write_diff_file "$diff_file" "$target" "README.md"
+
+  out=$(PATH="$fakebin:$PATH" CI=true GITHUB_ACTIONS=true FM_LINT_JOBS=1 \
+    FM_TEST_GIT_BRANCH=feature FM_TEST_GIT_DIFF_FILE="$diff_file" FM_TEST_OPTION_LOG="$options" \
+    "$LINT" --base-ref origin/main 2>&1) \
+    || fail "CI base-ref lint run failed"$'\n'"$out"
+  [ "$(cat "$log")" = "$target" ] \
+    || fail "CI base-ref lint did not run ShellCheck on exactly the PR-changed file"$'\n'"logged: $(cat "$log")"
+  assert_contains "$(cat "$options")" --norc \
+    "CI base-ref lint did not retain the isolated ShellCheck configuration"
+  assert_not_contains "$(cat "$options")" --external-sources \
+    "CI base-ref lint re-expanded the PR scope through sourced modules"
+  assert_contains "$(cat "$options")" --exclude=SC1091 \
+    "CI base-ref lint did not suppress source-dependent findings"
+  assert_contains "$(cat "$options")" --exclude=SC2329 \
+    "CI base-ref lint did not suppress source-dependent findings"
+  pass "fm-lint.sh --base-ref keeps PR lint scoped under CI"
 }
 
 test_explicit_full_mode_ignores_local_diff_context() {
@@ -1035,6 +1070,7 @@ test_worker_trees_stop_on_signal
 test_seeded_module_boundary_parity
 test_changed_mode_lints_only_the_changed_file
 test_ci_forces_full_lint_even_with_empty_diff
+test_ci_base_ref_lints_changed_files
 test_explicit_full_mode_ignores_local_diff_context
 test_main_branch_forces_full_lint
 test_explicit_path_bypasses_changed_logic

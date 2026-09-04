@@ -15,10 +15,7 @@ make_verify_fixture() {
   cp "$VERIFY" "$dir/bin/fm-verify.sh"
   cat > "$dir/bin/fm-lint.sh" <<'SH'
 #!/usr/bin/env bash
-[ "$#" -eq 1 ] && [ "$1" = --full ] || {
-  printf 'expected canonical --full lint mode\n' >&2
-  exit 2
-}
+printf '%s\n' "$*" > "${FM_TEST_LINT_ARGS:?}"
 printf 'lint-ok\n'
 SH
   chmod +x "$dir/bin/fm-verify.sh" "$dir/bin/fm-lint.sh"
@@ -30,18 +27,27 @@ SH
 }
 
 test_canonical_verify_contract() {
-  local dir out status
+  local dir out status lint_args
   dir="$TMP_ROOT/verify"
   make_verify_fixture "$dir"
+  lint_args="$dir/lint-args"
 
-  out=$(FM_ROOT_OVERRIDE="$dir" "$dir/bin/fm-verify.sh" 2>&1) \
+  out=$(FM_ROOT_OVERRIDE="$dir" FM_TEST_LINT_ARGS="$lint_args" "$dir/bin/fm-verify.sh" 2>&1) \
     || fail "canonical verifier rejected a valid repository fixture: $out"
+  [ "$(cat "$lint_args")" = --full ] \
+    || fail "canonical verifier did not select the full repository lint by default"
   assert_contains "$out" "verified: canonical repository checks passed" \
     "canonical verifier did not report its deterministic success"
 
+  out=$(FM_ROOT_OVERRIDE="$dir" FM_TEST_LINT_ARGS="$lint_args" \
+    "$dir/bin/fm-verify.sh" --base-ref deadbeef 2>&1) \
+    || fail "canonical verifier rejected a supplied PR base: $out"
+  [ "$(cat "$lint_args")" = "--base-ref deadbeef" ] \
+    || fail "canonical verifier did not forward the exact PR base to lint"
+
   printf '%s\n' '@WRONG.md' > "$dir/CLAUDE.md"
   status=0
-  out=$(FM_ROOT_OVERRIDE="$dir" "$dir/bin/fm-verify.sh" 2>&1) || status=$?
+  out=$(FM_ROOT_OVERRIDE="$dir" FM_TEST_LINT_ARGS="$lint_args" "$dir/bin/fm-verify.sh" 2>&1) || status=$?
   expect_code 1 "$status" "canonical verifier must reject a wrong CLAUDE.md target"
   assert_contains "$out" "CLAUDE.md must point to AGENTS.md" \
     "wrong instruction alias refusal was not diagnostic"
@@ -51,7 +57,7 @@ test_canonical_verify_contract() {
   printf '%s\n' secret > "$dir/data/tracked.txt"
   git -C "$dir" add -f data/tracked.txt
   status=0
-  out=$(FM_ROOT_OVERRIDE="$dir" "$dir/bin/fm-verify.sh" 2>&1) || status=$?
+  out=$(FM_ROOT_OVERRIDE="$dir" FM_TEST_LINT_ARGS="$lint_args" "$dir/bin/fm-verify.sh" 2>&1) || status=$?
   expect_code 1 "$status" "canonical verifier must reject tracked private fleet data"
   assert_contains "$out" "private fleet paths are tracked" \
     "tracked-private-path refusal was not diagnostic"

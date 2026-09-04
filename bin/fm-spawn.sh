@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
 #        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
@@ -14,8 +14,8 @@
 #   scaffolded before that line existed warns once and launches on the flag. When
 #   the explicit mode carries less rigor than the project's standing posture, a
 #   loud one-line deviation notice is printed and the spawn continues.
-#   no-mistakes-prod-only is a registry policy rather than a task mode and is
-#   refused as a flag value.
+#   Legacy no-mistakes annotations are inactive migration compatibility and are
+#   refused as flag values.
 #        fm-spawn.sh <task-id> --relaunch [--harness <name>] [--model <name>] [--effort <level>]
 #   --relaunch launches a replacement agent for an EXISTING task into that
 #   task's own recorded endpoint and worktree instead of creating either. It is
@@ -52,8 +52,9 @@
 #   session provider only, exactly like herdr/zellij, so it does. An
 #   auto-detected herdr or cmux spawn prints a loud stderr notice;
 #   auto-detected tmux stays silent; zellij and orca are never auto-detected.
-#   codex-app is not a known backend yet; docs/codex-app-backend.md owns that
-#   blocked backend contract. Default tmux spawns do not write backend= to meta;
+#   codex-app is not a shell-spawn backend; a Desktop primary registers its
+#   host-created tasks as codex-app-host through bin/fm-codex-app-task.sh and
+#   docs/codex-app-backend.md. Default tmux spawns do not write backend= to meta;
 #   absent backend= means tmux. cmux does not support --secondmate spawns yet.
 #   A backend spawn refusal (missing dependency, version gate, unauthenticated
 #   socket, or unsupported secondmate mode) is terminal for that selected backend;
@@ -303,7 +304,7 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-trace-context-lib.sh"
 # shellcheck source=bin/fm-remote-readiness-lib.sh
 . "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
-# Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
+# Fail closed before any fleet mutation: an inactive legacy no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
@@ -409,24 +410,14 @@ else
   # and record no delivery posture; secondmate spawns hardcode theirs.
   if [ "$KIND" = ship ]; then
     [ "$MODE_SET" -eq 1 ] || {
-      echo "error: ship spawns require --mode <no-mistakes|direct-PR|local-only>; resolve it at intake from the captain's instruction and the project's registered posture in data/projects.md" >&2
+      echo "error: ship spawns require --mode <direct-PR|local-only>; resolve it at intake from the captain's instruction and the project's registered posture in data/projects.md" >&2
       exit 1
     }
     [ "$YOLO_SET" -eq 1 ] || {
-      echo "error: ship spawns require --yolo <on|off>; it is this task's merge authority, not a project lookup" >&2
+      echo "error: ship spawns require --yolo <on|off>; it is this task's routine approval authority, not a project lookup" >&2
       exit 1
     }
-    case "$MODE" in
-      no-mistakes|direct-PR|local-only) ;;
-      no-mistakes-prod-only)
-        echo "error: no-mistakes-prod-only is a registry policy, not a task mode; classify this task's surface and resolve it to no-mistakes or direct-PR at intake" >&2
-        exit 1 ;;
-      *) echo "error: --mode must be one of no-mistakes, direct-PR, local-only (got '$MODE')" >&2; exit 1 ;;
-    esac
-    case "$YOLO" in
-      on|off) ;;
-      *) echo "error: --yolo must be on or off (got '$YOLO')" >&2; exit 1 ;;
-    esac
+    fm_control_ship_delivery_validate "$MODE" "$YOLO" "--mode" || exit 1
   else
     [ "$MODE_SET" -eq 0 ] || {
       echo "error: --mode applies only to ship spawns; a scout delivers a report and a secondmate records its own fixed posture" >&2
@@ -440,9 +431,10 @@ else
 fi
 
 spawn_remote_secondmate() {
-  local id=$1 remote host root home harness positional model effort backend out rc meta tmp
+  local id=$1 remote host root home projects harness positional model effort backend out rc meta tmp
   local remote_backend remote_target remote_harness remote_herdr_session registry_lock remote_lock remote_generation
-  local remote_traceparent remote_recorded_traceparent
+  local remote_traceparent remote_recorded_traceparent meta_present=0 meta_signature current_signature
+  local control_acquired_here=0
   local -a launch_args
   id=${POS[0]:-}
   fm_task_id_creation_valid "$id" || { echo "error: invalid task id" >&2; return 2; }
@@ -452,6 +444,48 @@ spawn_remote_secondmate() {
     echo "error: another spawn is already creating task $id" >&2
     return 1
   fi
+  SPAWN_TASK_LOCK_HELD=1
+  SPAWN_CONTROL_LOCK=$(fm_control_lock_path "$STATE" "$id") || return 1
+  if [ "$SPAWN_CONTROL_PARENT" = 1 ]; then
+    if ! fm_control_lock_owned_by_process "$STATE" "$id" "$PPID" fm-control.sh; then
+      fm_lock_release "$SPAWN_TASK_LOCK" || true
+      echo "error: the parent relaunch no longer owns task $id control" >&2
+      return 1
+    fi
+  elif [ "$SPAWN_CONTROL_LOCK_HELD" = 1 ]; then
+    if ! fm_control_lock_owned_by_process "$STATE" "$id" "${BASHPID:-$$}" fm-spawn.sh; then
+      fm_lock_release "$SPAWN_TASK_LOCK" || true
+      echo "error: this spawn no longer owns task $id control" >&2
+      return 1
+    fi
+  elif ! fm_control_lock_acquire_bounded "$STATE" "$id" fm-spawn.sh 1 0; then
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    echo "error: another lifecycle action is already running for task $id" >&2
+    return 1
+  else
+    SPAWN_CONTROL_LOCK_HELD=1
+    control_acquired_here=1
+  fi
+  meta="$STATE/$id.meta"
+  if ! SPAWN_META_LOCK=$(fm_meta_lock_path "$meta"); then
+    if [ "$control_acquired_here" = 1 ]; then
+      SPAWN_CONTROL_LOCK_HELD=0
+      fm_lock_release "$SPAWN_CONTROL_LOCK" || true
+    fi
+    SPAWN_TASK_LOCK_HELD=0
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    return 1
+  fi
+  if ! fm_meta_lock_acquire_bounded "$meta" fm-spawn.sh; then
+    if [ "$control_acquired_here" = 1 ]; then
+      SPAWN_CONTROL_LOCK_HELD=0
+      fm_lock_release "$SPAWN_CONTROL_LOCK" || true
+    fi
+    SPAWN_TASK_LOCK_HELD=0
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    return 1
+  fi
+  SPAWN_META_LOCK_HELD=1
   registry_lock=$(secondmate_registry_lock_path "$STATE")
   if ! fm_lock_acquire_wait "$registry_lock"; then
     fm_lock_release "$SPAWN_TASK_LOCK" || true
@@ -461,12 +495,20 @@ spawn_remote_secondmate() {
   remote=$(secondmate_registry_field "$DATA/secondmates.md" "$id" remote 2>/dev/null || true)
   if [ "$remote" != 1 ]; then
     fm_lock_release "$registry_lock" || true
+    SPAWN_TASK_LOCK_HELD=0
     fm_lock_release "$SPAWN_TASK_LOCK" || true
+    SPAWN_META_LOCK_HELD=0
+    fm_lock_release "$SPAWN_META_LOCK" || true
+    if [ "$control_acquired_here" = 1 ]; then
+      SPAWN_CONTROL_LOCK_HELD=0
+      fm_lock_release "$SPAWN_CONTROL_LOCK" || true
+    fi
     return 3
   fi
   host=$(secondmate_registry_field "$DATA/secondmates.md" "$id" host)
   root=$(secondmate_registry_field "$DATA/secondmates.md" "$id" root)
   home=$(secondmate_registry_field "$DATA/secondmates.md" "$id" home)
+  projects=$(secondmate_registry_field "$DATA/secondmates.md" "$id" projects)
   positional=${POS[1]:-}
   if [ "${#POS[@]}" -gt 2 ]; then
     fm_lock_release "$registry_lock" || true
@@ -524,7 +566,6 @@ spawn_remote_secondmate() {
       return 1
       ;;
   esac
-  meta="$STATE/$id.meta"
   if [ -e "$meta" ] || [ -L "$meta" ]; then
     if ! fm_backlog_record_present "$meta" "task record" "$STATE" \
       || [ "$(fm_meta_get "$meta" kind)" != secondmate ] \
@@ -534,6 +575,13 @@ spawn_remote_secondmate() {
       fm_lock_release "$registry_lock" || true
       fm_lock_release "$SPAWN_TASK_LOCK" || true
       echo "error: existing metadata for $id does not identify this remote secondmate route" >&2
+      return 1
+    fi
+    meta_present=1
+    if ! meta_signature=$(cksum < "$meta" | awk '{ print $1 ":" $2 }'); then
+      fm_lock_release "$registry_lock" || true
+      fm_lock_release "$SPAWN_TASK_LOCK" || true
+      echo "error: existing metadata for $id could not be bound to this remote launch" >&2
       return 1
     fi
   fi
@@ -641,6 +689,33 @@ spawn_remote_secondmate() {
     echo "error: remote launch returned Herdr session '${remote_herdr_session:-missing}', expected 'fm-remote'; preserving the remote route for reconciliation" >&2
     return 1
   fi
+  if [ "$(secondmate_registry_field "$DATA/secondmates.md" "$id" remote 2>/dev/null || true)" != 1 ] \
+    || [ "$(secondmate_registry_field "$DATA/secondmates.md" "$id" host 2>/dev/null || true)" != "$host" ] \
+    || [ "$(secondmate_registry_field "$DATA/secondmates.md" "$id" root 2>/dev/null || true)" != "$root" ] \
+    || [ "$(secondmate_registry_field "$DATA/secondmates.md" "$id" home 2>/dev/null || true)" != "$home" ] \
+    || [ "$(secondmate_registry_field "$DATA/secondmates.md" "$id" projects 2>/dev/null || true)" != "$projects" ]; then
+    fm_lock_release "$remote_lock" || true
+    fm_lock_release "$registry_lock" || true
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    echo "error: remote secondmate $id route changed during launch; preserving the endpoint for reconciliation" >&2
+    return 1
+  fi
+  if [ "$meta_present" -eq 1 ]; then
+    current_signature=$(cksum < "$meta" | awk '{ print $1 ":" $2 }') || current_signature=
+    if [ "$current_signature" != "$meta_signature" ]; then
+      fm_lock_release "$remote_lock" || true
+      fm_lock_release "$registry_lock" || true
+      fm_lock_release "$SPAWN_TASK_LOCK" || true
+      echo "error: remote secondmate $id task incarnation changed during launch; preserving the endpoint for reconciliation" >&2
+      return 1
+    fi
+  elif [ -e "$meta" ] || [ -L "$meta" ]; then
+    fm_lock_release "$remote_lock" || true
+    fm_lock_release "$registry_lock" || true
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    echo "error: remote secondmate $id task incarnation appeared during launch; preserving the endpoint for reconciliation" >&2
+    return 1
+  fi
   # Record what the remote endpoint ACTUALLY carries, read back from its own
   # launch, rather than what this side hoped to deliver. That keeps the #995
   # guarantee that the recorded carrier is the identity the child received even
@@ -663,7 +738,7 @@ spawn_remote_secondmate() {
     echo "model=${model#-}"
     echo "effort=${effort#-}"
     echo "home=$home"
-    echo "projects=$(secondmate_registry_field "$DATA/secondmates.md" "$id" projects)"
+    echo "projects=$projects"
     echo "remote_host=$host"
     echo "remote_root=$root"
     echo "remote_backend=$remote_backend"
@@ -688,7 +763,14 @@ spawn_remote_secondmate() {
   fi
   fm_lock_release "$remote_lock" || true
   fm_lock_release "$registry_lock" || true
+  SPAWN_TASK_LOCK_HELD=0
   fm_lock_release "$SPAWN_TASK_LOCK" || true
+  SPAWN_META_LOCK_HELD=0
+  fm_lock_release "$SPAWN_META_LOCK" || true
+  if [ "$SPAWN_CONTROL_LOCK_HELD" = 1 ]; then
+    SPAWN_CONTROL_LOCK_HELD=0
+    fm_lock_release "$SPAWN_CONTROL_LOCK" || true
+  fi
   "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort || true
   if ! "$SCRIPT_DIR/fm-procevent-remote-reply.sh" arm "$id" >/dev/null; then
     echo "error: remote secondmate $id launched, but its reply source could not be armed; endpoint metadata is preserved" >&2
@@ -987,9 +1069,11 @@ if [ "$RELAUNCH" -ne 1 ]; then
   fm_lease_forbid_branch "new-task spawn (fm-spawn)"
 fi
 if [ "$RELAUNCH" -eq 1 ]; then
-  SPAWN_CONTROL_LOCK="$STATE/.control-$ID.lock"
-  control_owner=$(cat "$SPAWN_CONTROL_LOCK/pid" 2>/dev/null || true)
-  if [ "$control_owner" = "$PPID" ] && fm_pid_alive "$control_owner"; then
+  SPAWN_CONTROL_LOCK=$(fm_control_lock_path "$STATE" "$ID") || {
+    echo "error: could not resolve lifecycle control for task $ID" >&2
+    exit 1
+  }
+  if fm_control_lock_owned_by_process "$STATE" "$ID" "$PPID" fm-control.sh; then
     SPAWN_CONTROL_PARENT=1
   elif [ "$(fm_lease_actor)" = branch ]; then
     # Role partition refinement: branch recovery relaunches only through the
@@ -997,7 +1081,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
     # this entrypoint directly (contract: bin/fm-lease-lib.sh).
     echo "error: relaunch (fm-spawn) refused - the supervision branch must relaunch through fm-control" >&2
     exit "$FM_LEASE_REFUSE_EXIT"
-  elif fm_lock_try_acquire "$SPAWN_CONTROL_LOCK"; then
+  elif fm_control_lock_acquire_bounded "$STATE" "$ID" fm-spawn.sh 1 0; then
     SPAWN_CONTROL_LOCK_HELD=1
   else
     echo "error: another lifecycle action is already running for task $ID" >&2
@@ -1104,7 +1188,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
     exit 1
   }
   SPAWN_META_LOCK=$(fm_meta_lock_path "$RELAUNCH_META") || exit 1
-  fm_lock_acquire_wait "$SPAWN_META_LOCK"
+  fm_meta_lock_acquire_bounded "$RELAUNCH_META" fm-spawn.sh || exit 1
   SPAWN_META_LOCK_HELD=1
   fm_backlog_record_present "$RELAUNCH_META" "task record" "$STATE" || {
     echo "error: --relaunch refused after locking: $FM_BACKLOG_TRANSITION_ERROR" >&2
@@ -1113,6 +1197,14 @@ if [ "$RELAUNCH" -eq 1 ]; then
   fm_backend_validate_task_endpoint "$RELAUNCH_META" "$ID" || exit 1
   BACKEND=$FM_BACKEND_VALIDATED_BACKEND
   RELAUNCH_TARGET=$FM_BACKEND_VALIDATED_TARGET
+  RELAUNCH_PRIOR_HARNESS=$(fm_meta_get "$RELAUNCH_META" harness)
+  KIND=$(fm_meta_get "$RELAUNCH_META" kind)
+  [ -n "$KIND" ] || KIND=ship
+  MODE=$(fm_meta_get "$RELAUNCH_META" mode)
+  YOLO=$(fm_meta_get "$RELAUNCH_META" yolo)
+  if [ "$KIND" = ship ]; then
+    fm_control_ship_delivery_validate "$MODE" "$YOLO" "task $ID's recorded delivery mode" || exit 1
+  fi
   fm_backend_validate_spawn "$BACKEND" || exit 1
   fm_backend_source "$BACKEND" || exit 1
   # A relaunch must PROVE the previous agent is gone before it launches another
@@ -1127,11 +1219,6 @@ if [ "$RELAUNCH" -eq 1 ]; then
     echo "error: task $ID's endpoint reads '$RELAUNCH_STATE'; a relaunch requires a positively agent-free endpoint (stop the agent first with bin/fm-control.sh $ID exit)" >&2
     exit 1
   }
-  RELAUNCH_PRIOR_HARNESS=$(fm_meta_get "$RELAUNCH_META" harness)
-  KIND=$(fm_meta_get "$RELAUNCH_META" kind)
-  [ -n "$KIND" ] || KIND=ship
-  MODE=$(fm_meta_get "$RELAUNCH_META" mode)
-  YOLO=$(fm_meta_get "$RELAUNCH_META" yolo)
   RELAUNCH_WT=$(fm_meta_get "$RELAUNCH_META" worktree)
   [ -n "$RELAUNCH_WT" ] && [ -d "$RELAUNCH_WT" ] || {
     echo "error: task $ID's recorded worktree '${RELAUNCH_WT:-none}' is missing; refusing to relaunch without the local copy its work lives in" >&2
@@ -1767,9 +1854,8 @@ else
 fi
 [ -f "$BRIEF" ] || { echo "error: task $ID has no brief at inaccessible data path $BRIEF" >&2; exit 1; }
 
-delivery_rigor_rank() {  # <mode> -> 3 (most rigor) .. 1 (least); 0 = not a task mode
+delivery_rigor_rank() {  # <mode> -> 2 (PR) or 1 (local); 0 = not a task mode
   case "$1" in
-    no-mistakes) echo 3 ;;
     direct-PR) echo 2 ;;
     local-only) echo 1 ;;
     *) echo 0 ;;
@@ -1791,11 +1877,11 @@ if [ "$KIND" = ship ]; then
   fi
   # The registry holds the captain's standing posture, so dropping below it is
   # allowed (a current explicit captain instruction wins) but never silent. An
-  # unregistered project resolves to the same no-mistakes standing default, which
+  # unregistered project resolves to the same direct-PR standing default, which
   # is why the notice names the standing posture rather than the registry line. A
   # conditional policy is excluded: both of its legs are legitimate classifications.
   STANDING_MODE=$("$FM_ROOT/bin/fm-project-mode.sh" --raw "$PROJ_NAME" 2>/dev/null | cut -d' ' -f1) || STANDING_MODE=
-  if [ -n "$STANDING_MODE" ] && [ "$STANDING_MODE" != no-mistakes-prod-only ] \
+  if [ -n "$STANDING_MODE" ] && [ "$STANDING_MODE" != no-mistakes ] && [ "$STANDING_MODE" != no-mistakes-prod-only ] \
      && [ "$(delivery_rigor_rank "$MODE")" -lt "$(delivery_rigor_rank "$STANDING_MODE")" ]; then
     echo "notice: $ID ships mode=$MODE while the standing posture for $PROJ_NAME is $STANDING_MODE - less rigor than the captain's standing posture; proceed only on a current explicit captain instruction or an intake judgment you can state" >&2
   fi
@@ -2046,7 +2132,7 @@ fi
 
 if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
   SPAWN_META_LOCK=$(fm_meta_lock_path "$STATE/$ID.meta") || exit 1
-  fm_lock_acquire_wait "$SPAWN_META_LOCK"
+  fm_meta_lock_acquire_bounded "$STATE/$ID.meta" fm-spawn.sh || exit 1
   SPAWN_META_LOCK_HELD=1
 fi
 if [ -e "$STATE/$ID.backlog-close" ] || [ -L "$STATE/$ID.backlog-close" ]; then
@@ -2787,7 +2873,7 @@ fi
 # validate/merge stages can branch on it. A ship task carries the explicit
 # per-task decision validated above; a secondmate's posture is fixed; a scout
 # records none at all, because its deliverable is a report rather than a merge
-# (fm-teardown.sh defaults an absent mode to no-mistakes, and fm-promote.sh
+# (fm-teardown.sh treats an absent ship mode as protected, and fm-promote.sh
 # requires an explicit mode when a scout is promoted to a ship task).
 if [ "$KIND" = secondmate ]; then
   MODE=secondmate
@@ -2833,7 +2919,7 @@ SPAWN_GEN="s$(date +%s).${BASHPID:-$$}.$RANDOM"
 SPAWN_META_PATH="$STATE/$ID.meta"
 if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
   SPAWN_META_LOCK=$(fm_meta_lock_path "$STATE/$ID.meta") || exit 1
-  fm_lock_acquire_wait "$SPAWN_META_LOCK"
+  fm_meta_lock_acquire_bounded "$STATE/$ID.meta" fm-spawn.sh || exit 1
   SPAWN_META_LOCK_HELD=1
 fi
 if [ "$RELAUNCH" -eq 1 ]; then
@@ -3014,7 +3100,7 @@ spawn_record_traceparent() {
   # independent critical section so other metadata interfaces can serialize.
   if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
     SPAWN_META_LOCK=$(fm_meta_lock_path "$meta") || return 1
-    fm_lock_acquire_wait "$SPAWN_META_LOCK"
+    fm_meta_lock_acquire_bounded "$meta" fm-spawn.sh || return 1
     SPAWN_META_LOCK_HELD=1
     acquired=1
   fi
@@ -3102,7 +3188,7 @@ fi
 # per-task lock as metadata publication, then and only then report success.
 if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
   SPAWN_META_LOCK=$(fm_meta_lock_path "$STATE/$ID.meta") || exit 1
-  fm_lock_acquire_wait "$SPAWN_META_LOCK"
+  fm_meta_lock_acquire_bounded "$STATE/$ID.meta" fm-spawn.sh || exit 1
   SPAWN_META_LOCK_HELD=1
 fi
 SPAWN_DEFERRED_SIGNAL=

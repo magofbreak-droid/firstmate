@@ -82,7 +82,7 @@ stand_down() {
   exit 0
 }
 
-# The same two eligibility owners the nudge wrapper uses, so a no-mistakes gate
+# The same two eligibility owners the nudge wrapper uses, so an inactive legacy no-mistakes gate
 # agent and an unmarked task worktree can never run a session start for a home
 # they do not own. Pi's preflight-only status preserves that intentional silence
 # without mistaking it for a failed eligible attempt that needs the manual nudge.
@@ -90,14 +90,14 @@ fm_is_gate_agent "$FM_ROOT" && stand_down
 fm_primary_scope_matches "$FM_ROOT" "$STATE" || stand_down
 
 session_start_completed() {
-  local lock_pid completion_pid
+  local lock_record completion_record
   [ -f "$STATE/.lock" ] && [ ! -L "$STATE/.lock" ] || return 1
   [ -f "$COMPLETION_FILE" ] && [ ! -L "$COMPLETION_FILE" ] || return 1
   fm_session_lock_owned_by_self "$STATE" || return 1
-  lock_pid=$(cat "$STATE/.lock" 2>/dev/null) || return 1
-  completion_pid=$(cat "$COMPLETION_FILE" 2>/dev/null) || return 1
-  case "$lock_pid" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$completion_pid" = "$lock_pid" ]
+  lock_record=$(cat "$STATE/.lock" 2>/dev/null) || return 1
+  completion_record=$(cat "$COMPLETION_FILE" 2>/dev/null) || return 1
+  fm_session_lock_record_valid "$lock_record" || return 1
+  [ "$completion_record" = "$lock_record" ]
 }
 
 if [ -z "$SOURCE" ] && [ ! -t 0 ]; then

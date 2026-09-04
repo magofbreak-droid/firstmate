@@ -12,8 +12,7 @@
 # tasks-axi update advertises --archive-body, whether its mv help advertises
 # multi-ID moves, whether quota-axi is on PATH,
 # whether the local backend config opts out of tasks-axi backlog mutations,
-# which no-mistakes version is on PATH, which gh-axi version is on PATH, and
-# which lavish-axi version is on PATH.
+# which gh-axi version is on PATH, and which lavish-axi version is on PATH.
 # Dedicated fleet-sync cases pin the computed bootstrap timeout, explicit
 # override, blank-env defaulting, partial-output relay, and pre-launch timeout
 # scan.
@@ -25,6 +24,8 @@ set -u
 
 # shellcheck source=tests/lib.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=bin/fm-session-lock-lib.sh
+. "$ROOT/bin/fm-session-lock-lib.sh"
 
 BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
 TMP_ROOT=$(fm_test_tmproot fm-bootstrap-tests)
@@ -311,6 +312,8 @@ ROWS
   pass "bootstrap reports treehouse lease + tasks-axi/quota-axi bootstrap contracts"
 }
 
+# Inactive migration compatibility: retained on disk for legacy bootstrap
+# evidence, but not invoked by the active direct-PR suite.
 test_no_mistakes_min_version() {
   local label version mode case_dir fakebin out missing n
   missing='MISSING: no-mistakes (install: curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh | sh)'
@@ -453,6 +456,11 @@ ROWS
 
 # These rows exercise the real bootstrap check with a fake quota-axi answering
 # --version: below the floor produces MISSING, while at or above is silent.
+# 0.1.16 is the first quota-axi that reports per-credential auth sources and Grok
+# state.authStatus. Before it, a dispatch candidate could not be scoped to its own
+# authentication surface, which is exactly how one harness's expired CLI token
+# produced a captain-facing "log in" claim for a candidate that never read it. A
+# stale install used to pass this check silently, so the fix stayed uninstalled.
 test_quota_axi_min_version() {
   local label version mode case_dir fakebin out missing n
   missing='MISSING: quota-axi (install: npm install -g quota-axi)'
@@ -929,7 +937,7 @@ SH
 }
 
 test_network_sweeps_recheck_lock_ownership() {
-  local case_dir fakebin fake_root marker out
+  local case_dir fakebin fake_root marker out typed_lock lease rc
   case_dir="$TMP_ROOT/network-lock-handoff"
   mkdir -p "$case_dir/home/config" "$case_dir/home/projects" "$case_dir/home/state"
   printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
@@ -957,6 +965,44 @@ SH
     "the stale worker did not report the refused handoff sweep"
   assert_contains "$out" "changed before project clone refresh" \
     "the stale worker did not report the refused clone refresh"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+pid=
+previous=
+for argument in "$@"; do
+  [ "$previous" = -p ] && pid=$argument
+  previous=$argument
+done
+if [ "$pid" = "${FM_FAKE_DESKTOP_PID:-}" ]; then
+  case "$*" in
+    *args=*) printf 'bash /fixture/bin/fm-session-start.sh\n' ;;
+    *lstart=*) printf 'Mon Aug 31 10:00:00 2026\n' ;;
+  esac
+else
+  /bin/ps "$@"
+fi
+SH
+  chmod +x "$fakebin/ps"
+  sleep 30 &
+  lease=$!
+  typed_lock=$(CODEX_THREAD_ID=019ff1ae-966b-7643-ba01-48811234656e \
+    CODEX_INTERNAL_ORIGINATOR_OVERRIDE='Codex Desktop' \
+    FM_CODEX_DESKTOP_LEASE_PID="$lease" FM_FAKE_DESKTOP_PID="$lease" \
+    PATH="$fakebin:$BASE_PATH" fm_codex_desktop_new_lock_record) \
+    || fail "could not create a live typed Desktop lock fixture"
+  printf '%s\n' "$typed_lock" > "$case_dir/home/state/.lock"
+  rm -f "$marker"
+  rc=0
+  PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$fake_root" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_BOOTSTRAP_NETWORK=only \
+    FM_FAKE_DESKTOP_PID="$lease" \
+    FM_BOOTSTRAP_NETWORK_LOCK_PID="$typed_lock" FM_FAKE_FLEET_SYNC_STARTED_MARKER="$marker" \
+    "$ROOT/bin/fm-bootstrap.sh" >/dev/null || rc=$?
+  kill "$lease" 2>/dev/null || true
+  wait "$lease" 2>/dev/null || true
+  [ "$rc" -eq 0 ] || fail "the live typed Desktop lock bootstrap worker failed"
+  [ -f "$marker" ] \
+    || fail "the exact typed Desktop owner was denied the deferred mutating sweeps"
   pass "bootstrap: every deferred mutating sweep rechecks fleet-lock ownership"
 }
 
@@ -1149,7 +1195,6 @@ ROWS
 }
 
 test_bootstrap_reporting
-test_no_mistakes_min_version
 test_gh_axi_min_version
 test_lavish_axi_min_version
 test_tasks_axi_min_version

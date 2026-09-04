@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # tests/fm-secondmate-safety.test.sh - secondmate home safety invariants:
 # the path-boundary matrices (seed/spawn/teardown), registry/charter/origin
-# validation, treehouse lease handling, no-mistakes initialization of new
-# clones, child-worktree protection, and backlog-handoff safety. The happy-path
+# validation, treehouse lease handling, direct-PR clone reuse without legacy
+# initialization, child-worktree protection, and backlog-handoff safety. The happy-path
 # operator flow lives in fm-secondmate-lifecycle-e2e.test.sh; this file keeps the
 # destructive-invariant coverage that an e2e run cannot deterministically reach.
 set -u
@@ -48,7 +48,7 @@ SH
 }
 
 test_fm_home_parameterization() {
-  local brief home_one home_two out
+  local brief home_one home_two out fakebin
   home_one="$TMP_ROOT/home one"
   home_two="$TMP_ROOT/home-two"
   mkdir -p "$home_one/data" "$home_one/state" "$home_two/data" "$home_two/state"
@@ -57,9 +57,9 @@ test_fm_home_parameterization() {
   out=$(FM_HOME="$home_one" "$ROOT/bin/fm-project-mode.sh" app)
   [ "$out" = "local-only on" ] || fail "fm-project-mode did not read projects.md from FM_HOME"
   out=$(FM_HOME="$home_two" "$ROOT/bin/fm-project-mode.sh" app 2>/dev/null)
-  [ "$out" = "no-mistakes off" ] || fail "fm-project-mode did not isolate missing registry by home"
+  [ "$out" = "direct-PR off" ] || fail "fm-project-mode did not isolate the direct-PR default by home"
 
-  FM_HOME="$home_one" "$ROOT/bin/fm-brief.sh" task-a app --mode no-mistakes >/dev/null || fail "brief scaffold failed under FM_HOME"
+  FM_HOME="$home_one" "$ROOT/bin/fm-brief.sh" task-a app --mode direct-PR >/dev/null || fail "brief scaffold failed under FM_HOME"
   brief="$home_one/data/task-a/brief.md"
   [ -f "$brief" ] || fail "brief was not written under FM_HOME/data"
   grep -F ">> '$home_one/state/task-a.status'" "$brief" >/dev/null || fail "brief did not shell-quote FM_HOME state path"
@@ -73,8 +73,33 @@ test_fm_home_parameterization() {
   brief="$home_one/data/task-c/brief.md"
   grep -F ">> '$home_one/state/task-c.status'" "$brief" >/dev/null || fail "secondmate brief did not shell-quote FM_HOME state path"
 
-  printf 'project=x\n' > "$home_one/state/task-a.meta"
-  FM_HOME="$home_one" FM_GUARD_GRACE=999999 "$ROOT/bin/fm-pr-check.sh" task-a https://github.com/example/repo/pull/1 >/dev/null 2>/dev/null \
+  mkdir -p "$home_one/worktree"
+  printf 'project=x\nworktree=%s\nmode=direct-PR\nyolo=off\n' "$home_one/worktree" > "$home_one/state/task-a.meta"
+  chmod 0600 "$home_one/state/task-a.meta"
+  fakebin="$TMP_ROOT/home-parameterization-fakebin"
+  mkdir -p "$fakebin"
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+head=0000000000000000000000000000000000000001
+case " $* " in
+  *"/branches/"*"/protection"*) printf 'require\trequired\tnone\tVerify exact PR head\tnone\tnone\t15368\tnone\n' ;;
+  *"/rules/branches/"*) ;;
+  *"/check-runs?"*) printf 'result\tcheck\t%s\tVerify exact PR head\tcompleted\tsuccess\t15368\tgithub-actions\n' "$head" ;;
+  *"/status?"*) ;;
+  *" baseRefName "*) printf '%s\n' main ;;
+  *" headRefOid "*) printf '%s\n' "$head" ;;
+esac
+SH
+  cat > "$fakebin/gh-axi" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' 'summary: 1 passed, 0 failed, 1 total'
+printf '%s\n' 'checks[1]{name,conclusion}:'
+printf '%s\n' '  Verify exact PR head,pass'
+SH
+  chmod +x "$fakebin/gh" "$fakebin/gh-axi"
+  PATH="$fakebin:$PATH" FM_HOME="$home_one" FM_GUARD_GRACE=999999 \
+    FM_PR_CI_ATTEMPTS=1 FM_PR_CI_INTERVAL=0 \
+    "$ROOT/bin/fm-pr-check.sh" task-a https://github.com/example/repo/pull/1 >/dev/null 2>/dev/null \
     || fail "fm-pr-check failed under FM_HOME"
   [ -f "$home_one/state/task-a.check.sh" ] || fail "pr check was not written under FM_HOME/state"
   [ ! -e "$home_two/state/task-a.check.sh" ] || fail "pr check leaked into another home"
@@ -97,8 +122,8 @@ test_lock_status_is_per_home() {
 test_seed_allows_overlapping_clones_and_drops_owner() {
   # A project may appear in several secondmates' (non-exclusive) clone lists; the
   # registry never uses the legacy owns: field, and the removed `owner` subcommand
-  # stays gone. The full happy seed - charter copied, clones+origins, no-mistakes
-  # init, modes preserved - is asserted by fm-secondmate-lifecycle-e2e.
+  # stays gone. The full happy seed - charter copied, clones+origins, no legacy
+  # initialization, modes preserved - is asserted by fm-secondmate-lifecycle-e2e.
   local home design other
   home="$TMP_ROOT/overlap-main"
   design="$TMP_ROOT/overlap-design"
@@ -876,7 +901,7 @@ test_home_seed_refuses_local_only_project() {
   if FM_HOME="$home" "$ROOT/bin/fm-home-seed.sh" design "$subhome" alpha >/dev/null 2>"$err"; then
     fail "seed allowed a local-only project into a secondmate home"
   fi
-  grep -F 'project alpha is local-only; secondmate routes support only no-mistakes and direct-PR projects' "$err" >/dev/null \
+  grep -F 'project alpha is local-only; secondmate routes support only direct-PR projects' "$err" >/dev/null \
     || fail "seed did not explain local-only project rejection"
   [ ! -e "$subhome" ] || fail "seed created a subhome before rejecting a local-only project"
   pass "home seeding refuses local-only projects"
@@ -1142,12 +1167,12 @@ test_home_seed_resolves_relative_source_origins() {
   pass "home seeding resolves relative source origins against the source project"
 }
 
-test_home_seed_skips_initialized_existing_no_mistakes_projects() {
+test_home_seed_reuses_existing_direct_pr_projects_without_legacy_init() {
   local home subhome err fakebin log origin
   home="$TMP_ROOT/existing-initialized-home"
   subhome="$TMP_ROOT/existing-initialized-subhome"
   err="$TMP_ROOT/existing-initialized.err"
-  log="$TMP_ROOT/existing-initialized-no-mistakes.log"
+  log="$TMP_ROOT/existing-direct-pr-no-mistakes.log"
   mkdir -p "$home/projects" "$home/data" "$home/state"
   fm_git_init_commit "$home/projects/alpha"
   fm_git_init_commit "$home/projects/beta"
@@ -1157,32 +1182,29 @@ test_home_seed_skips_initialized_existing_no_mistakes_projects() {
   mkdir -p "$subhome/projects"
   origin=$(git -C "$home/projects/alpha" remote get-url origin)
   git clone --quiet "$origin" "$subhome/projects/alpha"
-  git -C "$subhome/projects/alpha" remote add no-mistakes "$TMP_ROOT/no-mistakes-alpha.git"
-  printf '%s\n' '- alpha - alpha project (added 2026-06-22)' '- beta - beta project (added 2026-06-22)' > "$home/data/projects.md"
+  printf '%s\n' '- alpha [direct-PR] - alpha project (added 2026-06-22)' '- beta [direct-PR] - beta project (added 2026-06-22)' > "$home/data/projects.md"
   fakebin=$(make_recording_no_mistakes "$TMP_ROOT/existing-initialized-fake")
   : > "$log"
 
-  if PATH="$fakebin:$PATH" FM_FAKE_NO_MISTAKES_LOG="$log" FM_FAKE_NO_MISTAKES_FAIL_PROJECT=beta \
+  if ! PATH="$fakebin:$PATH" FM_FAKE_NO_MISTAKES_LOG="$log" FM_FAKE_NO_MISTAKES_FAIL_PROJECT=beta \
     FM_HOME="$home" FM_SECONDMATE_CHARTER='existing init rollback scope' FM_SECONDMATE_SCOPE='existing init rollback scope' \
     "$ROOT/bin/fm-home-seed.sh" design "$subhome" alpha beta >/dev/null 2>"$err"; then
-    fail "seed succeeded even though later no-mistakes initialization failed"
+    fail "direct-PR seed refused reusable clones when the retired initializer was unavailable"
   fi
-  grep -F 'failed to initialize no-mistakes for beta' "$err" >/dev/null \
-    || fail "seed did not explain later no-mistakes initialization failure"
-  grep -F "$subhome/projects/alpha" "$log" >/dev/null \
-    && fail "seed ran no-mistakes against an initialized existing clone"
-  [ ! -f "$subhome/projects/alpha/.no-mistakes-init" ] || fail "seed mutated initialized existing clone with no-mistakes init"
-  [ ! -f "$subhome/projects/alpha/.no-mistakes-doctor" ] || fail "seed mutated initialized existing clone with no-mistakes doctor"
-  [ ! -e "$subhome/projects/beta" ] || fail "failed seed left a newly cloned project after no-mistakes failure"
-  pass "home seeding skips initialized existing no-mistakes clones"
+  [ ! -s "$log" ] || fail "direct-PR seed invoked the retired no-mistakes initializer"
+  [ -d "$subhome/projects/alpha/.git" ] || fail "direct-PR seed lost the reusable existing clone"
+  [ -d "$subhome/projects/beta/.git" ] || fail "direct-PR seed did not create the missing clone"
+  [ ! -f "$subhome/projects/alpha/.no-mistakes-init" ] || fail "direct-PR seed wrote a legacy init marker"
+  [ ! -f "$subhome/projects/beta/.no-mistakes-doctor" ] || fail "direct-PR seed wrote a legacy doctor marker"
+  pass "home seeding reuses direct-PR clones without legacy initialization"
 }
 
-test_home_seed_refuses_uninitialized_existing_no_mistakes_project() {
+test_home_seed_accepts_existing_direct_pr_clone_without_legacy_init() {
   local home subhome err fakebin log origin
   home="$TMP_ROOT/existing-uninitialized-home"
   subhome="$TMP_ROOT/existing-uninitialized-subhome"
   err="$TMP_ROOT/existing-uninitialized.err"
-  log="$TMP_ROOT/existing-uninitialized-no-mistakes.log"
+  log="$TMP_ROOT/existing-direct-pr-no-legacy.log"
   mkdir -p "$home/projects" "$home/data" "$home/state"
   fm_git_init_commit "$home/projects/alpha"
   fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/uninitialized-alpha.git"
@@ -1190,20 +1212,19 @@ test_home_seed_refuses_uninitialized_existing_no_mistakes_project() {
   mkdir -p "$subhome/projects"
   origin=$(git -C "$home/projects/alpha" remote get-url origin)
   git clone --quiet "$origin" "$subhome/projects/alpha"
-  printf '%s\n' '- alpha - alpha project (added 2026-06-22)' > "$home/data/projects.md"
+  printf '%s\n' '- alpha [direct-PR] - alpha project (added 2026-06-22)' > "$home/data/projects.md"
   fakebin=$(make_recording_no_mistakes "$TMP_ROOT/existing-uninitialized-fake")
   : > "$log"
 
-  if PATH="$fakebin:$PATH" FM_FAKE_NO_MISTAKES_LOG="$log" \
+  if ! PATH="$fakebin:$PATH" FM_FAKE_NO_MISTAKES_LOG="$log" \
     FM_HOME="$home" FM_SECONDMATE_CHARTER='existing uninitialized scope' \
     "$ROOT/bin/fm-home-seed.sh" design "$subhome" alpha >/dev/null 2>"$err"; then
-    fail "seed initialized a preexisting no-mistakes clone"
+    fail "direct-PR seed refused an existing clone without legacy initialization"
   fi
-  grep -F 'refusing to mutate preexisting clone' "$err" >/dev/null \
-    || fail "seed did not explain uninitialized existing no-mistakes clone refusal"
-  [ ! -s "$log" ] || fail "seed ran no-mistakes before refusing an uninitialized existing clone"
-  [ ! -f "$subhome/projects/alpha/.no-mistakes-init" ] || fail "seed mutated uninitialized existing clone"
-  pass "home seeding refuses uninitialized existing no-mistakes clones"
+  [ ! -s "$log" ] || fail "direct-PR seed invoked the retired no-mistakes initializer"
+  [ -d "$subhome/projects/alpha/.git" ] || fail "direct-PR seed removed the existing clone"
+  [ ! -f "$subhome/projects/alpha/.no-mistakes-init" ] || fail "direct-PR seed wrote a legacy init marker"
+  pass "home seeding accepts existing direct-PR clones without legacy initialization"
 }
 
 test_home_seed_refuses_project_destinations_outside_subhome() {
@@ -1915,7 +1936,7 @@ worktree=$childwt
 project=$childproj
 harness=echo
 kind=ship
-mode=no-mistakes
+mode=direct-PR
 yolo=off
 EOF
   fakebin=$(make_fake_tmux "$TMP_ROOT/force-teardown-fake")
@@ -1936,6 +1957,64 @@ EOF
   pass "secondmate force teardown discards child work"
 }
 
+test_secondmate_force_teardown_refuses_child_quarantine_symlink() {
+  local home subhome childproj childwt external fakebin log err rc
+  home="$TMP_ROOT/force-quarantine-home"
+  subhome="$TMP_ROOT/force-quarantine-subhome"
+  childproj="$subhome/projects/alpha"
+  childwt="$TMP_ROOT/force-quarantine-child-worktree"
+  external="$TMP_ROOT/force-quarantine-external"
+  err="$TMP_ROOT/force-quarantine.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state" "$external"
+  fm_git_worktree "$childproj" "$childwt" force-quarantine-child
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  cat > "$home/state/domain.meta" <<EOF
+window=firstmate:fm-domain
+worktree=$subhome
+project=$subhome
+harness=echo
+kind=secondmate
+mode=secondmate
+yolo=off
+home=$subhome
+projects=alpha
+EOF
+  printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
+  cat > "$subhome/state/child.meta" <<EOF
+window=firstmate:fm-child
+worktree=$childwt
+project=$childproj
+harness=echo
+kind=ship
+mode=direct-PR
+yolo=off
+EOF
+  printf 'child check\n' > "$subhome/state/child.check.sh"
+  printf 'external quarantine artifact\n' > "$external/child.check.protected"
+  chmod 0640 "$external/child.check.protected"
+  ln -s "$external" "$subhome/state/.pr-check-quarantine"
+  fakebin=$(make_fake_tmux "$TMP_ROOT/force-quarantine-fake")
+  log="$TMP_ROOT/force-quarantine-fake/tmux.log"
+
+  set +e
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/force-quarantine-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2> "$err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "force teardown accepted a child quarantine-directory symlink"
+  [ -d "$subhome" ] || fail "force teardown removed the subhome before quarantine refusal"
+  [ -d "$childwt" ] || fail "force teardown removed child work before quarantine refusal"
+  [ -e "$home/state/domain.meta" ] || fail "force teardown cleared parent meta before quarantine refusal"
+  [ -e "$subhome/state/child.meta" ] || fail "force teardown cleared child meta before quarantine refusal"
+  [ "$(cat "$subhome/state/child.check.sh")" = 'child check' ] || fail "force teardown removed the child check before quarantine refusal"
+  [ "$(cat "$external/child.check.protected")" = 'external quarantine artifact' ] \
+    || fail "force teardown changed the child quarantine symlink target"
+  [ "$(file_mode "$external/child.check.protected")" = 640 ] \
+    || fail "force teardown changed the child quarantine target mode"
+  grep -F 'kill-window' "$log" >/dev/null && fail "force teardown killed a window before child quarantine validation"
+  pass "secondmate force teardown prevalidates child quarantine cleanup without following symlinks"
+}
 test_secondmate_force_teardown_preserves_child_on_unproven_lock() {
   local home subhome childproj childwt fakebin log err rc lock
   home="$TMP_ROOT/force-lock-home"
@@ -1964,7 +2043,7 @@ worktree=$childwt
 project=$childproj
 harness=echo
 kind=ship
-mode=no-mistakes
+mode=direct-PR
 yolo=off
 EOF
   fakebin=$(make_fake_tmux "$TMP_ROOT/force-lock-child-fake")
@@ -2267,7 +2346,7 @@ worktree=$childwt
 project=$childproj
 harness=echo
 kind=ship
-mode=no-mistakes
+mode=direct-PR
 yolo=off
 EOF
   fakebin=$(make_fake_tmux "$TMP_ROOT/prevalidate-teardown-fake")
@@ -2322,7 +2401,7 @@ worktree=$childwt
 project=$childproj
 harness=echo
 kind=ship
-mode=no-mistakes
+mode=direct-PR
 yolo=off
 EOF
   printf '%s|%s\n' "$home" "$subhome"
@@ -2605,7 +2684,7 @@ worktree=$childwt
 project=$childproj
 harness=echo
 kind=ship
-mode=no-mistakes
+mode=direct-PR
 yolo=off
 EOF
   fakebin=$(make_fake_tmux "$TMP_ROOT/child-active-descendant-fake")
@@ -2656,7 +2735,7 @@ worktree=$childwt
 project=$childproj
 harness=echo
 kind=ship
-mode=no-mistakes
+mode=direct-PR
 yolo=off
 EOF
   fakebin=$(make_fake_tmux "$TMP_ROOT/child-repo-descendant-fake")
@@ -2701,7 +2780,7 @@ worktree=$childwt
 project=$childproj
 harness=echo
 kind=ship
-mode=no-mistakes
+mode=direct-PR
 yolo=off
 EOF
   fakebin=$(make_fake_tmux "$TMP_ROOT/unregistered-child-fake")
@@ -2931,8 +3010,8 @@ test_home_seed_refuses_home_overlapping_registered_home
 test_home_seed_refuses_remote_backed_project_without_origin
 test_home_seed_refuses_existing_remote_backed_project_with_wrong_origin
 test_home_seed_resolves_relative_source_origins
-test_home_seed_skips_initialized_existing_no_mistakes_projects
-test_home_seed_refuses_uninitialized_existing_no_mistakes_project
+test_home_seed_reuses_existing_direct_pr_projects_without_legacy_init
+test_home_seed_accepts_existing_direct_pr_clone_without_legacy_init
 test_home_seed_refuses_project_destinations_outside_subhome
 test_home_seed_refuses_operational_dirs_outside_subhome
 test_home_seed_refuses_unsafe_leaf_files

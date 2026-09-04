@@ -72,6 +72,7 @@ make_fake_root() {
   # wedge detector's bounded worktree write probe.
   ln -s "$ROOT/bin/fm-timeout-lib.sh" "$fake/bin/fm-timeout-lib.sh"
   ln -s "$ROOT/bin/fm-wake-lib.sh" "$fake/bin/fm-wake-lib.sh"
+  ln -s "$ROOT/bin/fm-session-lock-lib.sh" "$fake/bin/fm-session-lock-lib.sh"
   # fm-gate-refuse-lib.sh: teardown sources it before any fleet mutation.
   ln -s "$ROOT/bin/fm-gate-refuse-lib.sh" "$fake/bin/fm-gate-refuse-lib.sh"
   # fm-pr-lib.sh: teardown uses its canonical task-ID validator for poll cleanup.
@@ -117,7 +118,7 @@ worktree=$TMP_ROOT/nonexistent-worktree-$id
 project=$TMP_ROOT/nonexistent-project-$id
 harness=claude
 kind=ship
-mode=no-mistakes
+mode=direct-PR
 yolo=off
 tasktmp=$tasktmp
 META
@@ -165,6 +166,7 @@ test_teardown_skips_gracefully_without_tasktmp() {
   # wedge detector's bounded worktree write probe.
   ln -s "$ROOT/bin/fm-timeout-lib.sh" "$fake/bin/fm-timeout-lib.sh"
   ln -s "$ROOT/bin/fm-wake-lib.sh" "$fake/bin/fm-wake-lib.sh"
+  ln -s "$ROOT/bin/fm-session-lock-lib.sh" "$fake/bin/fm-session-lock-lib.sh"
   # fm-gate-refuse-lib.sh: teardown sources it before any fleet mutation.
   ln -s "$ROOT/bin/fm-gate-refuse-lib.sh" "$fake/bin/fm-gate-refuse-lib.sh"
   # fm-pr-lib.sh: teardown uses its canonical task-ID validator for poll cleanup.
@@ -203,7 +205,7 @@ worktree=$TMP_ROOT/nonexistent-wt-$id
 project=$TMP_ROOT/nonexistent-proj-$id
 harness=claude
 kind=ship
-mode=no-mistakes
+mode=direct-PR
 yolo=off
 META
   FM_HOME="$fake" bash "$fake/bin/fm-teardown.sh" "$id" >/dev/null 2>&1 \

@@ -16,6 +16,99 @@
 # shellcheck source=bin/fm-cursor-lib.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/fm-cursor-lib.sh"
 
+# Print the current Codex Desktop thread id when the app-provided identity is
+# complete and well formed, or return 1 outside Codex Desktop.
+fm_codex_desktop_thread_id() {
+  local thread=${CODEX_THREAD_ID:-}
+  [ "${CODEX_INTERNAL_ORIGINATOR_OVERRIDE:-}" = "Codex Desktop" ] || return 1
+  printf '%s' "$thread" \
+    | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+    || return 1
+  printf '%s\n' "$thread"
+}
+
+# Print a new Desktop session-lock record from the app thread id and the one
+# tracked foreground lease pid established by fm-session-start.sh.
+fm_pid_exists_for_signal() {  # <pid>
+  local err
+  if err=$(LC_ALL=C kill -0 "$1" 2>&1); then
+    return 0
+  fi
+  # A sandbox can deny signaling a process outside the current tool-call
+  # container even though that process is alive. POSIX kill(2) returns EPERM
+  # only after resolving an existing pid, so this is positive liveness evidence,
+  # not an unreadable/absent process being treated as live.
+  case "$err" in
+    *'Operation not permitted'*|*'operation not permitted'*) return 0 ;;
+  esac
+  return 1
+}
+
+fm_process_command_identity() {  # <pid> <expected-command>
+  local pid=$1 expected=$2 args started digest
+  [ -n "$expected" ] || return 1
+  fm_pid_exists_for_signal "$pid" || return 1
+  args=$(ps -ww -o args= -p "$pid" 2>/dev/null) || return 1
+  case "$args" in *"$expected"*) ;; *) return 1 ;; esac
+  started=$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null) || return 1
+  started=$(printf '%s\n' "$started" | awk '{$1=$1; print}')
+  [ -n "$started" ] || return 1
+  if command -v shasum >/dev/null 2>&1; then
+    digest=$(printf '%s\n%s\n' "$started" "$args" \
+      | env -u LC_CTYPE LC_ALL=C LANG=C shasum -a 256 2>/dev/null | awk '{print $1}')
+  elif command -v sha256sum >/dev/null 2>&1; then
+    digest=$(printf '%s\n%s\n' "$started" "$args" \
+      | env -u LC_CTYPE LC_ALL=C LANG=C sha256sum 2>/dev/null | awk '{print $1}')
+  else
+    return 1
+  fi
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$digest"
+}
+
+fm_codex_desktop_lease_identity() {  # <pid>
+  fm_process_command_identity "$1" fm-session-start.sh
+}
+
+fm_codex_desktop_new_lock_record() {
+  local thread identity pid=${FM_CODEX_DESKTOP_LEASE_PID:-}
+  thread=$(fm_codex_desktop_thread_id) || return 1
+  case "$pid" in ''|*[!0-9]*|0|1) return 1 ;; esac
+  identity=$(fm_codex_desktop_lease_identity "$pid") || return 1
+  printf 'codex-desktop:%s:%s:%s\n' "$thread" "$pid" "$identity"
+}
+
+# Split a Desktop record into its thread, pid, and process identity globals,
+# rejecting every non-canonical shape.
+FM_CODEX_DESKTOP_RECORD_THREAD=
+FM_CODEX_DESKTOP_RECORD_PID=
+FM_CODEX_DESKTOP_RECORD_IDENTITY=
+fm_codex_desktop_parse_lock_record() {
+  local record=$1 kind thread pid identity extra
+  IFS=: read -r kind thread pid identity extra <<EOF
+$record
+EOF
+  [ "$kind" = codex-desktop ] && [ -z "$extra" ] || return 1
+  printf '%s' "$thread" \
+    | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+    || return 1
+  case "$pid" in ''|*[!0-9]*|0|1|0*) return 1 ;; esac
+  [[ "$identity" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [ "$record" = "codex-desktop:$thread:$pid:$identity" ] || return 1
+  FM_CODEX_DESKTOP_RECORD_THREAD=$thread
+  FM_CODEX_DESKTOP_RECORD_PID=$pid
+  FM_CODEX_DESKTOP_RECORD_IDENTITY=$identity
+}
+
+fm_session_lock_record_valid() {
+  local record=$1
+  case "$record" in
+    codex-desktop:*) fm_codex_desktop_parse_lock_record "$record" ;;
+    ''|*[!0-9]*) return 1 ;;
+    *) [ "$record" -ge 2 ] ;;
+  esac
+}
+
 # Known harness command names; extend when a new adapter is verified.
 FM_HARNESS_RE='claude|codex|opencode|grok|kimi|^pi$|^pi-signed$'
 
@@ -152,6 +245,44 @@ fm_harness_pid_alive() {
   fm_harness_process_matches "$comm" "$args"
 }
 
+# True when one complete lock record still names a live owner.
+# Legacy harness records remain plain numeric pids. Desktop records bind the
+# app-provided thread id to a foreground lease pid so a different live chat can
+# never reclaim the home, while a dead lease remains recoverable.
+fm_session_lock_owner_alive() {
+  local record=$1
+  case "$record" in
+    codex-desktop:*)
+      fm_codex_desktop_parse_lock_record "$record" || return 1
+      [ "$(fm_codex_desktop_lease_identity "$FM_CODEX_DESKTOP_RECORD_PID")" \
+        = "$FM_CODEX_DESKTOP_RECORD_IDENTITY" ]
+      ;;
+    *) fm_session_lock_record_valid "$record" && fm_harness_pid_alive "$record" ;;
+  esac
+}
+
+# Print the identity this shell call must publish or preserve for state dir $1.
+# Later tool calls from the same Desktop chat do not inherit the lease variable,
+# so they preserve their already-live thread-bound record instead of inventing a
+# transient owner from the current tool subprocess.
+fm_session_identity_for_state() {
+  local state=$1 thread existing
+  if thread=$(fm_codex_desktop_thread_id); then
+    existing=$(cat "$state/.lock" 2>/dev/null || true)
+    if fm_codex_desktop_parse_lock_record "$existing" \
+      && [ "$FM_CODEX_DESKTOP_RECORD_THREAD" = "$thread" ] \
+      && fm_session_lock_owner_alive "$existing"; then
+      printf '%s\n' "$existing"
+      return 0
+    fi
+    if [ -n "${FM_CODEX_DESKTOP_LEASE_PID:-}" ]; then
+      fm_codex_desktop_new_lock_record
+      return
+    fi
+  fi
+  fm_harness_ancestry_pid
+}
+
 # True when state dir $1 holds a session lock whose pid is ANY harness ancestor
 # of the current process: this script runs inside the session that owns the
 # home's fleet lock. Membership is the honest test of that question, because the
@@ -161,14 +292,21 @@ fm_harness_pid_alive() {
 # lock, a malformed lock, a lock held by a harness outside this ancestry, or an
 # ancestry that cannot be resolved all fail closed.
 fm_session_lock_owned_by_self() {
-  local state=$1 lock_pid pids pid
-  lock_pid=$(cat "$state/.lock" 2>/dev/null || true)
-  case "$lock_pid" in
+  local state=$1 lock_record thread pids pid
+  lock_record=$(cat "$state/.lock" 2>/dev/null || true)
+  case "$lock_record" in
+    codex-desktop:*)
+      thread=$(fm_codex_desktop_thread_id) || return 1
+      fm_codex_desktop_parse_lock_record "$lock_record" || return 1
+      [ "$FM_CODEX_DESKTOP_RECORD_THREAD" = "$thread" ] || return 1
+      fm_session_lock_owner_alive "$lock_record"
+      return
+      ;;
     ''|*[!0-9]*) return 1 ;;
   esac
   pids=$(fm_harness_ancestry_pids) || return 1
   while IFS= read -r pid; do
-    [ "$pid" = "$lock_pid" ] && return 0
+    [ "$pid" = "$lock_record" ] && return 0
   done <<EOF
 $pids
 EOF

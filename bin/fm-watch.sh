@@ -3,8 +3,8 @@
 # Classifies supervision wakes in bash. In normal mode it absorbs benign wakes
 # and keeps blocking; it queues and exits only for actionable wakes.
 # The no-verb signal and stale path is absorb-only-on-positive-evidence: a wake
-# is absorbed only when the crew shows it is still working through an actively
-# running no-mistakes step or a backend busy signal. A home that opts in with
+# is absorbed only when the crew shows it is still working through an exact
+# Desktop current-state record or a backend busy signal. A home that opts in with
 # config/turnend-churn-absorb lets a bare turn-end also use bounded pane churn
 # since the previous poll. Every other no-verb wake surfaces, so a crew
 # that finishes (or stops and waits) is never silently swallowed. A declared wait,
@@ -20,7 +20,7 @@
 #                          timer) regardless of what the status log says - an active
 #                          run-step or busy pane outranks even a captain-relevant log
 #                          line, since the crew's own log gets no new entry once
-#                          firstmate hands it to a no-mistakes validation. A declared
+#                          firstmate begins exact-head PR validation. A declared
 #                          external-wait pause or verified captain-held transfer is
 #                          absorbed instead with its own long re-surface cadence,
 #                          never as a wedge, and that recheck reason names which
@@ -117,6 +117,8 @@ mkdir -p "$STATE"
 # worker while adding no uncovered file.
 # shellcheck source=/dev/null
 . "$SCRIPT_DIR/fm-merge-outcome-lib.sh"
+# shellcheck source=bin/fm-pr-lifecycle-lock-lib.sh
+. "$SCRIPT_DIR/fm-pr-lifecycle-lock-lib.sh"
 # shellcheck source=bin/fm-x-lib.sh
 . "$SCRIPT_DIR/fm-x-lib.sh"
 # shellcheck source=bin/fm-check-lib.sh
@@ -185,7 +187,7 @@ TURNEND_CHURN_ABSORB_SECS=${FM_TURNEND_CHURN_ABSORB_SECS:-900}  # longest a task
 # and ABSORBS the benign majority - it advances the suppression marker, logs to a
 # debug log, and keeps blocking WITHOUT enqueuing or exiting. The no-verb signal
 # / stale path is absorb-only-on-positive-evidence. The shared proof is an actively
-# running no-mistakes step or a busy pane via crew_is_provably_working over
+# running exact Desktop state or a busy pane via crew_is_provably_working over
 # fm-crew-state.sh; where config/turnend-churn-absorb opts in, a bare turn-end alone
 # may also use bounded pane churn since the previous poll.
 # Every other crew that stopped its turn is SURFACED, so a finish reported
@@ -1400,8 +1402,40 @@ home_summary_refresh_detached() {
   HOME_SUMMARY_PID=$!
 }
 
+PR_WATCH_LIFECYCLE_ID=
+PR_WATCH_META_LOCK=
+PR_WATCH_META_LOCK_HELD=0
+pr_watch_lifecycle_release() {
+  if [ "$PR_WATCH_META_LOCK_HELD" = 1 ]; then
+    fm_lock_release "$PR_WATCH_META_LOCK" || true
+    PR_WATCH_META_LOCK_HELD=0
+  fi
+  PR_WATCH_META_LOCK=
+  [ -n "$PR_WATCH_LIFECYCLE_ID" ] || return 0
+  fm_pr_lifecycle_lock_release "$STATE" "$PR_WATCH_LIFECYCLE_ID" watch || true
+  PR_WATCH_LIFECYCLE_ID=
+}
+
+pr_watch_lifecycle_acquire() {
+  local id=$1 meta
+  [ -z "$PR_WATCH_LIFECYCLE_ID" ] && [ "$PR_WATCH_META_LOCK_HELD" = 0 ] || return 1
+  fm_pr_lifecycle_lock_acquire "$STATE" "$id" watch || return 1
+  PR_WATCH_LIFECYCLE_ID=$id
+  meta="$STATE/$id.meta"
+  PR_WATCH_META_LOCK=$(fm_meta_lock_path "$meta") || {
+    pr_watch_lifecycle_release
+    return 1
+  }
+  if ! fm_pr_lifecycle_metadata_lock_acquire "$meta" watch; then
+    pr_watch_lifecycle_release
+    return 1
+  fi
+  PR_WATCH_META_LOCK_HELD=1
+}
+
 watcher_cleanup() {
   local cleanup_status=0 owns_lock=0 transition=release-lock
+  pr_watch_lifecycle_release
   if [ "$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)" = "${WATCHER_PID:-}" ]; then
     owns_lock=1
     if [ "${WATCHER_RECOVERY_PENDING:-0}" -eq 1 ] \
@@ -1437,7 +1471,28 @@ printf '%s\n' "$FM_WATCH_DELIVERY_IDENTITY" > "$WATCH_LOCK/pid-identity" 2>/dev/
 # A merged poll may have queued its terminal wake and then lost the process
 # between receipt publication and fixed-path removal.
 # Finish only identity-bound retirement receipts before any check can run.
-if ! fm_pr_poll_retirement_recover_all "$STATE" "$SCRIPT_DIR/fm-pr-poll.sh"; then
+recover_pr_poll_retirements_locked() {
+  local receipt id
+  FM_PR_POLL_RETIREMENT_REJECTED=
+  for receipt in "$STATE"/*.pr-poll-retirement; do
+    [ -e "$receipt" ] || [ -L "$receipt" ] || continue
+    id=$(basename "$receipt" .pr-poll-retirement)
+    if ! fm_pr_task_id_valid "$id" \
+      || ! pr_watch_lifecycle_acquire "$id"; then
+      FM_PR_POLL_RETIREMENT_REJECTED="$FM_PR_POLL_RETIREMENT_REJECTED $receipt"
+      continue
+    fi
+    if fm_pr_poll_retirement_recover_one "$STATE" "$id" "$SCRIPT_DIR/fm-pr-poll.sh"; then
+      :
+    else
+      FM_PR_POLL_RETIREMENT_REJECTED="$FM_PR_POLL_RETIREMENT_REJECTED $receipt"
+    fi
+    pr_watch_lifecycle_release
+  done
+  [ -z "$FM_PR_POLL_RETIREMENT_REJECTED" ]
+}
+
+if ! recover_pr_poll_retirements_locked; then
   reason="check: rejected unauthenticated PR poll retirement receipts:$FM_PR_POLL_RETIREMENT_REJECTED"
   fm_wake_append check pr-poll-retirement "$reason" || exit 1
   touch "$STATE/.last-check"
@@ -1564,8 +1619,9 @@ while :; do
           host=$FM_PR_POLL_SNAPSHOT_HOST
           path=$FM_PR_POLL_SNAPSHOT_PATH
           number=$FM_PR_POLL_SNAPSHOT_NUMBER
+          head=$FM_PR_POLL_SNAPSHOT_HEAD
           run_check_capture "$SCRIPT_DIR/fm-pr-poll.sh" --validated \
-            "$provider" "$url" "$host" "$path" "$number" || exit 1
+            "$provider" "$url" "$host" "$path" "$number" "$head" || exit 1
           out=$FM_CHECK_RESULT
         elif fm_custom_check_snapshot_prepare "$STATE" "$id"; then
           custom_snapshot=$FM_CUSTOM_CHECK_SNAPSHOT
@@ -1580,7 +1636,21 @@ while :; do
       fi
       if [ -n "$out" ]; then
         reason="check: $c: $out"
-        if [ "$is_pr_poll" -eq 1 ] && [ "$out" = merged ]; then
+        if [ "$is_pr_poll" -eq 1 ]; then
+          if ! pr_watch_lifecycle_acquire "$id"; then
+            triage_log "PR lifecycle ownership remained unavailable for watcher result $id"
+            exit 1
+          fi
+          if ! fm_pr_poll_snapshot_matches "$STATE" "$id" "$SCRIPT_DIR/fm-pr-poll.sh"; then
+            triage_log "discarded stale PR poll result after replacement for $id"
+            pr_watch_lifecycle_release
+            continue
+          fi
+          if [ "$out" != merged ]; then
+            rejected_checks="$rejected_checks $c"
+            pr_watch_lifecycle_release
+            continue
+          fi
           merge_outcome_rc=0
           fm_merge_outcome_report "$FM_HOME" "$STATE" "$id" "$url" poll \
             || merge_outcome_rc=$?
@@ -1592,6 +1662,7 @@ while :; do
           touch "$STATE/.last-check"
           if [ "$FM_MERGE_OUTCOME_ALREADY_RECORDED" = true ]; then
             triage_log "absorbed duplicate merged PR poll result for $id"
+            pr_watch_lifecycle_release
             continue
           fi
           wake "$reason"
@@ -1653,7 +1724,7 @@ EOF
     # Actionable -> enqueue, advance .seen-* markers, exit. Benign (a no-verb wake
     # whose crew is still executing) in always-on mode -> advance the markers so it
     # will not re-fire, log, and keep blocking without enqueuing. Both evidence
-    # checks are costly (a bounded no-mistakes call, then a pane capture), so the ||
+    # checks can be costly (an exact Desktop/backend query, then a pane capture), so the ||
     # ordering evaluates them ONLY for a non-afk signal with no captain-relevant
     # status span, and the capture only once the authoritative verdict comes up short.
     FM_SIGNAL_SURFACE_ENDPOINTS=''
@@ -1784,7 +1855,7 @@ EOF
         elif stale_is_terminal "$w" "$STATE"; then
           # The log's last line is captain-relevant - but that alone is not
           # proof the crew is actually done: a crew's own status log gets no
-          # new entry once firstmate hands it to a no-mistakes validation
+          # new entry once firstmate begins exact-head PR validation
           # (AGENTS.md's sparse status-reporting contract), so the log can
           # keep showing a "done:"/needs-decision/blocked leftover from
           # BEFORE that validation started for the run's entire (possibly

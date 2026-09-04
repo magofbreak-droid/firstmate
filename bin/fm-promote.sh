@@ -8,15 +8,14 @@
 # default-branch base, the fm/<task-id> branch, and - rendered from
 # bin/fm-dod-lib.sh, the single owner an ordinary ship brief also uses - the
 # mode-specific Definition of done, so a promoted worker receives exactly the same
-# delivery contract as a briefed one, including the no-mistakes mode's ask-user
-# escalation rule and --yes ban.
+# active delivery contract as a briefed one.
 # A scout records no delivery posture, so promotion is where this task's delivery
 # contract is decided: --mode and --yolo are REQUIRED and written into the meta
 # alongside the kind= flip. Firstmate resolves both at promotion time, having just
 # read the scout's report (AGENTS.md section 7); data/projects.md holds the
 # captain's standing posture as context, and this script never looks it up.
-# no-mistakes-prod-only is a registry policy rather than a task mode and is refused.
-# Usage: fm-promote.sh <task-id> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off>
+# Legacy no-mistakes annotations are inactive migration compatibility, not task modes.
+# Usage: fm-promote.sh <task-id> --mode <direct-PR|local-only> --yolo <on|off>
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -69,9 +68,9 @@ for a in "$@"; do
   esac
 done
 [ -z "$want_value" ] || { echo "error: --$want_value requires a value" >&2; exit 1; }
-[ "${#POS[@]}" -ge 1 ] || { echo "usage: fm-promote.sh <task-id> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off>" >&2; exit 1; }
+[ "${#POS[@]}" -ge 1 ] || { echo "usage: fm-promote.sh <task-id> --mode <direct-PR|local-only> --yolo <on|off>" >&2; exit 1; }
 [ "$MODE_SET" -eq 1 ] || {
-  echo "error: promotion requires --mode <no-mistakes|direct-PR|local-only>; decide it now from the scout's findings and the project's registered posture in data/projects.md" >&2
+  echo "error: promotion requires --mode <direct-PR|local-only>; decide it now from the scout's findings and the project's registered posture in data/projects.md" >&2
   exit 1
 }
 [ "$YOLO_SET" -eq 1 ] || {
@@ -79,11 +78,11 @@ done
   exit 1
 }
 case "$MODE" in
-  no-mistakes|direct-PR|local-only) ;;
-  no-mistakes-prod-only)
-    echo "error: no-mistakes-prod-only is a registry policy, not a task mode; classify this task's surface and resolve it to no-mistakes or direct-PR" >&2
+  direct-PR|local-only) ;;
+  no-mistakes|no-mistakes-prod-only)
+    echo "error: no-mistakes is retired; use direct-PR" >&2
     exit 1 ;;
-  *) echo "error: --mode must be one of no-mistakes, direct-PR, local-only (got '$MODE')" >&2; exit 1 ;;
+  *) echo "error: --mode must be one of direct-PR, local-only (got '$MODE')" >&2; exit 1 ;;
 esac
 case "$YOLO" in
   on|off) ;;
@@ -92,7 +91,7 @@ esac
 
 ID=${POS[0]}
 fm_task_id_creation_valid "$ID" || { echo "error: invalid task id" >&2; exit 2; }
-CONTROL_LOCK="$STATE/.control-$ID.lock"
+CONTROL_LOCK=$(fm_control_lock_path "$STATE" "$ID") || exit 1
 CONTROL_LOCK_HELD=0
 META_LOCK=
 META_LOCK_HELD=0
@@ -111,7 +110,7 @@ promote_cleanup() {
   return "$status"
 }
 trap promote_cleanup EXIT
-fm_lock_try_acquire "$CONTROL_LOCK" || {
+fm_control_lock_acquire_bounded "$STATE" "$ID" fm-promote.sh 1 0 || {
   echo "error: another lifecycle action is already running for task $ID; nothing was changed" >&2
   exit 1
 }
@@ -120,7 +119,7 @@ CONTROL_LOCK_HELD=1
 META="$STATE/$ID.meta"
 [ -d "$STATE" ] || { echo "error: state dir not found: $STATE" >&2; exit 1; }
 META_LOCK=$(fm_meta_lock_path "$META") || exit 1
-fm_lock_acquire_wait "$META_LOCK"
+fm_meta_lock_acquire_bounded "$META" fm-promote.sh || exit 1
 META_LOCK_HELD=1
 if ! fm_backlog_record_present "$META" "task record" "$STATE"; then
   echo "error: task record for $ID is unsafe or missing ($FM_BACKLOG_TRANSITION_ERROR)" >&2
@@ -130,9 +129,7 @@ grep -qx 'kind=scout' "$META" || { echo "error: task $ID is not a scout task (ki
 
 # The promoted worker must receive the same delivery contract an ordinary ship
 # brief carries, so the mode-specific Definition of done is rendered from its
-# single owner (bin/fm-dod-lib.sh) rather than summarised into a hint line. A
-# promoted no-mistakes worker that never received the ask-user escalation rule or
-# the --yes ban is the delivery hole this file used to leave open.
+# single owner (bin/fm-dod-lib.sh) rather than summarised into a hint line.
 INSTRUCTIONS="$DATA/$ID/ship-instructions.md"
 mkdir -p "$DATA/$ID"
 [ ! -d "$INSTRUCTIONS" ] || { echo "error: ship instructions path is a directory: $INSTRUCTIONS" >&2; exit 1; }

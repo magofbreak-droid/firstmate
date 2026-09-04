@@ -26,8 +26,10 @@
 # marker) with no explicit backend setting - unlike Orca, which stays
 # never-auto-detected because it also owns the task worktree; see
 # docs/cmux-backend.md for its empirical basis.
-# Codex App is intentionally not in the known set yet.
-# docs/codex-app-backend.md owns that blocked backend contract.
+# Codex Desktop host tasks are registered as `codex-app-host`: the app host
+# creates/delivers/waits/archives them, while Firstmate records their exact task
+# and worktree identity. It is accepted only by endpoint-metadata validation,
+# never by runtime backend selection or the shell spawn set.
 #
 # Compatibility contract: a task's meta may omit `backend=`; every reader here
 # treats that as `tmux` (fm_backend_of_meta), and fm-spawn.sh does not write
@@ -65,7 +67,6 @@ FM_BACKEND_CONFIG_DIR="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # spawn-capable; unlike tmux/herdr/zellij it is also the worktree provider.
 # cmux is EXPERIMENTAL and spawn-capable, session-provider-only like
 # herdr/zellij - verified against the real 0.64.17 binary (docs/cmux-backend.md).
-# codex-app remains deliberately absent; see docs/codex-app-backend.md.
 FM_BACKEND_KNOWN="tmux herdr zellij orca cmux"
 FM_BACKEND_SPAWN="tmux herdr zellij orca cmux"
 
@@ -385,7 +386,7 @@ fm_backend_endpoint_atom_valid() {  # <value>
 
 fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
   local meta=$1 id=$2 backend_count backend window worktree project binding_count binding
-  local session pane recorded_session workspace tab terminal worktree_id surface
+  local session pane recorded_session workspace tab terminal worktree_id surface thread host
   FM_BACKEND_VALIDATED_BACKEND=
   FM_BACKEND_VALIDATED_TARGET=
   [ -f "$meta" ] && [ ! -L "$meta" ] || {
@@ -418,7 +419,8 @@ fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
     1) backend=$(fm_backend_meta_exact_value "$meta" backend) || backend= ;;
     *) backend= ;;
   esac
-  if [ -z "$backend" ] || ! fm_backend_is_known "$backend"; then
+  if [ -z "$backend" ] \
+    || { [ "$backend" != codex-app-host ] && ! fm_backend_is_known "$backend"; }; then
     echo "REFUSED: task $id has a missing, ambiguous, or unknown backend identity; preserving task state." >&2
     return 1
   fi
@@ -523,6 +525,20 @@ fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
         return 1
       fi
       ;;
+    codex-app-host)
+      [ "$binding" = "$id" ] || {
+        echo "REFUSED: Codex Desktop endpoint metadata for task $id lacks an exact task binding; preserving task state." >&2
+        return 1
+      }
+      thread=$(fm_backend_meta_exact_value "$meta" codex_app_thread_id) || thread=
+      host=$(fm_backend_meta_exact_value "$meta" codex_app_host_id) || host=
+      if [ -z "$thread" ] || [ -z "$host" ] || [ "$window" != "$thread" ] \
+        || ! printf '%s' "$thread" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+        || ! fm_backend_endpoint_atom_valid "$host"; then
+        echo "REFUSED: Codex Desktop endpoint metadata for task $id is malformed or inconsistent; preserving task state." >&2
+        return 1
+      fi
+      ;;
   esac
   # shellcheck disable=SC2034 # Output globals are consumed by sourcing callers.
   FM_BACKEND_VALIDATED_BACKEND=$backend
@@ -593,41 +609,47 @@ fm_backend_expected_label_of_selector() {  # <raw-target> <state-dir>
 # boundaries keep runtime dispatch from importing all five adapter ASTs into
 # every dispatcher consumer while preserving the runtime source operations.
 fm_backend_source() {  # <name>
-  local name=$1
+  local name=$1 adapter
   fm_backend_validate "$name" || return 1
+  adapter="$FM_BACKEND_LIB_DIR/backends/$name.sh"
   case "$name" in
     tmux)
       if [ -z "${_FM_BACKEND_TMUX_SOURCED:-}" ]; then
+        [ -f "$adapter" ] || return 1
         # shellcheck source=/dev/null
-        . "$FM_BACKEND_LIB_DIR/backends/tmux.sh" || return 1
+        . "$adapter" || return 1
         _FM_BACKEND_TMUX_SOURCED=1
       fi
       ;;
     herdr)
       if [ -z "${_FM_BACKEND_HERDR_SOURCED:-}" ]; then
+        [ -f "$adapter" ] || return 1
         # shellcheck source=/dev/null
-        . "$FM_BACKEND_LIB_DIR/backends/herdr.sh" || return 1
+        . "$adapter" || return 1
         _FM_BACKEND_HERDR_SOURCED=1
       fi
       ;;
     zellij)
       if [ -z "${_FM_BACKEND_ZELLIJ_SOURCED:-}" ]; then
+        [ -f "$adapter" ] || return 1
         # shellcheck source=/dev/null
-        . "$FM_BACKEND_LIB_DIR/backends/zellij.sh" || return 1
+        . "$adapter" || return 1
         _FM_BACKEND_ZELLIJ_SOURCED=1
       fi
       ;;
     orca)
       if [ -z "${_FM_BACKEND_ORCA_SOURCED:-}" ]; then
+        [ -f "$adapter" ] || return 1
         # shellcheck source=/dev/null
-        . "$FM_BACKEND_LIB_DIR/backends/orca.sh" || return 1
+        . "$adapter" || return 1
         _FM_BACKEND_ORCA_SOURCED=1
       fi
       ;;
     cmux)
       if [ -z "${_FM_BACKEND_CMUX_SOURCED:-}" ]; then
+        [ -f "$adapter" ] || return 1
         # shellcheck source=/dev/null
-        . "$FM_BACKEND_LIB_DIR/backends/cmux.sh" || return 1
+        . "$adapter" || return 1
         _FM_BACKEND_CMUX_SOURCED=1
       fi
       ;;

@@ -105,7 +105,7 @@ esac
 
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
-# Fail closed before any fleet mutation: a no-mistakes gate agent must never
+# Fail closed before any fleet mutation: an inactive legacy no-mistakes gate agent must never
 # drive a crewmate's lifecycle (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
 
@@ -265,9 +265,10 @@ ID=$RAW_ID
 # shellcheck source=bin/fm-lease-lib.sh
 . "$SCRIPT_DIR/fm-lease-lib.sh"
 fm_lease_guard "$ID" "lifecycle control (fm-control)"
-CONTROL_LOCK="$STATE/.control-$ID.lock"
+CONTROL_LOCK=$(fm_control_lock_path "$STATE" "$ID") \
+  || die "could not resolve lifecycle control for task $ID"
 trap control_cleanup EXIT
-fm_lock_try_acquire "$CONTROL_LOCK" \
+fm_control_lock_acquire_bounded "$STATE" "$ID" fm-control.sh 1 0 \
   || die "another lifecycle action is already running for task $ID"
 CONTROL_LOCK_HELD=1
 META="$STATE/$ID.meta"
@@ -301,6 +302,8 @@ T=$FM_BACKEND_VALIDATED_TARGET
 LABEL="fm-$ID"
 RECORDED_HARNESS=$(fm_meta_get "$META" harness)
 KIND=$(fm_meta_get "$META" kind)
+MODE=$(fm_meta_get "$META" mode)
+YOLO=$(fm_meta_get "$META" yolo)
 WT=$(fm_meta_get "$META" worktree)
 [ -n "$KIND" ] || KIND=ship
 
@@ -785,6 +788,9 @@ do_relaunch() {
   local exit_result state note_line
   local -a spawn_args
 
+  if [ "$KIND" = ship ]; then
+    fm_control_ship_delivery_validate "$MODE" "$YOLO" "task $ID's recorded delivery mode" || exit 1
+  fi
   require_state_verified_backend relaunch
   resolve_relaunch_profile
 

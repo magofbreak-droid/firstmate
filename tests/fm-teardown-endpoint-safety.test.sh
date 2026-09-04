@@ -103,7 +103,8 @@ test_control_lock_contention_refuses_before_mutation() {
   (
     # shellcheck source=/dev/null
     . "$ROOT/bin/fm-wake-lib.sh"
-    fm_lock_try_acquire "$lock" || exit 1
+    fm_control_lock_acquire_bounded "$dir/home/state" "$id" \
+      fm-teardown-endpoint-safety.test.sh 1 0 || exit 1
     sleep 30
   ) &
   holder=$!
@@ -149,7 +150,8 @@ test_metadata_lock_serializes_destructive_cleanup() {
   (
     # shellcheck source=/dev/null
     . "$ROOT/bin/fm-wake-lib.sh"
-    fm_lock_try_acquire "$lock" || exit 1
+    fm_meta_lock_acquire_bounded "$dir/home/state/$id.meta" \
+      fm-teardown-endpoint-safety.test.sh || exit 1
     trap 'fm_lock_release "$lock"' EXIT
     : > "$ready"
     while [ ! -e "$release" ]; do
@@ -348,7 +350,7 @@ SH
   fm_write_meta "$dir/home/state/$target_id.meta" \
     "window=$session:$target" "endpoint_task_id=$target_id" \
     "worktree=$dir/nonexistent-worktree" "project=$dir/nonexistent-project" \
-    "kind=scout" "mode=no-mistakes"
+    "kind=scout" "mode=direct-PR"
   env -u TMUX -u TMUX_PANE FM_TEST_TMUX_SOCKET="$socket_id" \
     FM_HOME="$dir/home" FM_ROOT_OVERRIDE="$ROOT" FM_RUNTIME_LOG="$dir/runtime.log" \
     PATH="$dir/fakebin:$PATH" "$TEARDOWN" "$target_id" --force \

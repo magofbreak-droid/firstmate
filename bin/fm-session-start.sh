@@ -269,6 +269,12 @@ stage() {  # <stage-name>: breadcrumb for the parent's truncation banner
 . "$SCRIPT_DIR/fm-session-lock-lib.sh"
 
 if [ -z "${FM_SESSION_START_STAGE_FILE:-}" ]; then
+  PARENT_DESKTOP_LEASE=0
+  if fm_codex_desktop_thread_id >/dev/null 2>&1 && [ -t 0 ]; then
+    FM_CODEX_DESKTOP_LEASE_PID=$$
+    export FM_CODEX_DESKTOP_LEASE_PID
+    PARENT_DESKTOP_LEASE=1
+  fi
   SESSION_START_BUDGET=${FM_SESSION_START_TIMEOUT:-120}
   # A non-positive or non-numeric budget is not a budget (`timeout 0` disables
   # the deadline outright), so an unusable value falls back to the default
@@ -321,6 +327,19 @@ if [ -z "${FM_SESSION_START_STAGE_FILE:-}" ]; then
     printf '%s\n' "$BAR"
   fi
   rm -f "$SESSION_START_STAGE_FILE" 2>/dev/null || true
+  if [ "$PARENT_DESKTOP_LEASE" -eq 1 ] && fm_session_lock_owned_by_self "$STATE"; then
+    RULE='================================================================================'
+    printf '\n%s\nDESKTOP SESSION LEASE\n%s\n' "$RULE" "$RULE"
+    printf 'Codex Desktop thread %s now owns this Firstmate home.\n' "$(fm_codex_desktop_thread_id)"
+    printf 'Keep this tracked PTY open while Firstmate work is under way; send "stop" only after supervision is no longer required.\n'
+    while IFS= read -r desktop_command; do
+      case "$desktop_command" in
+        stop) break ;;
+        '') : ;;
+        *) printf 'Desktop session lease is active; supported input: stop\n' ;;
+      esac
+    done
+  fi
   exit 0
 fi
 
@@ -822,7 +841,11 @@ for meta in "$STATE"/*.meta; do
   target=$(fm_backend_target_of_meta "$meta")
   if [ -n "$window" ]; then
     backend=$(fm_backend_of_meta "$meta")
-    if fm_backend_target_exists "$backend" "${target:-$window}" "fm-$id"; then
+    if [ "$backend" = codex-app-host ]; then
+      current=$("$FM_ROOT/bin/fm-crew-state.sh" "$id" 2>/dev/null || true)
+      printf 'endpoint: host-managed (backend=%s task=%s; %s)\n' \
+        "$backend" "$window" "${current:-state unavailable}"
+    elif fm_backend_target_exists "$backend" "${target:-$window}" "fm-$id"; then
       printf 'endpoint: alive (backend=%s window=%s)\n' "$backend" "$window"
     else
       printf 'endpoint: dead (backend=%s window=%s)\n' "$backend" "$window"
@@ -948,9 +971,7 @@ EOF
 if [ "$READ_ONLY" -eq 0 ] && [ "$REEMIT" -eq 0 ]; then
   COMPLETION_RECORDED=0
   COMPLETION_PID=$(cat "$STATE/.lock" 2>/dev/null || true)
-  case "$COMPLETION_PID" in
-    ''|*[!0-9]*) COMPLETION_PID= ;;
-  esac
+  fm_session_lock_record_valid "$COMPLETION_PID" || COMPLETION_PID=
   COMPLETION_TMP=$(mktemp "$STATE/.session-start-complete.XXXXXX" 2>/dev/null || true)
   if [ -n "$COMPLETION_PID" ] && [ -n "$COMPLETION_TMP" ] \
     && printf '%s\n' "$COMPLETION_PID" > "$COMPLETION_TMP" 2>/dev/null \

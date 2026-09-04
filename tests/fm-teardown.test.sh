@@ -118,6 +118,7 @@ SH
   # path override FM_FAKE_AXI_STATUS/FM_FAKE_NM_ABORT_LOG before run_teardown.
   cat > "$fakebin/no-mistakes" <<'SH'
 #!/usr/bin/env bash
+[ -z "${FM_FAKE_NM_CALL_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_FAKE_NM_CALL_LOG"
 case "${1:-}" in
   axi)
     shift
@@ -243,15 +244,30 @@ case "${1:-} ${2:-}" in
     printf '%s\n' "count: 1 (showing first 1)" "pull_requests[1]{number,state}:" "  7,merged" ; exit 0 ;;
   "pr view")
     printf '%s\n' "pull_request:" "  number: 7" "  state: merged" '  merged: "2026-06-26T00:00:00Z"' ; exit 0 ;;
+  "pr checks")
+    printf '%s\n' 'summary: 1 passed, 0 failed, 1 total' 'checks[1]{name,conclusion}:' '  Verify exact PR head,pass' ; exit 0 ;;
 esac
 exit 0
 SH
   cat > "$case_dir/fakebin/gh" <<SH
 #!/usr/bin/env bash
+case " \$* " in
+  *"/branches/"*"/protection"*)
+    printf 'require\trequired\tnone\tVerify exact PR head\tnone\tnone\t15368\tnone\n'
+    exit 0
+    ;;
+  *"/rules/branches/"*) exit 0 ;;
+  *"/check-runs?"*)
+    printf 'result\tcheck\t%s\tVerify exact PR head\tcompleted\tsuccess\t15368\tgithub-actions\n' '$head'
+    exit 0
+    ;;
+  *"/status?"*) exit 0 ;;
+esac
 case "\${1:-} \${2:-}" in
   "pr view")
     case " \$* " in
       *"state,headRefOid,url"*) printf '%s\t%s\t%s\n' 'MERGED' '$head' 'https://github.com/example/repo/pull/7' ; exit 0 ;;
+      *"baseRefName"*) printf '%s\n' main ; exit 0 ;;
       *"headRefOid"*) printf '%s\n' '$head' ; exit 0 ;;
     esac
     ;;
@@ -556,7 +572,7 @@ make_path_without_lsof() {  # <case-dir>
   local case_dir=$1 path_dir="$1/path-without-lsof" cmd resolved
   mkdir -p "$path_dir"
   for cmd in awk bash basename cat chmod cp cut date dirname env find git grep head hostname id ln \
-    mkdir mktemp mv perl ps readlink realpath rm sed sh sleep sort stat tail timeout tr uname wc xargs; do
+    mkdir mktemp mv perl ps readlink realpath rm sed sh shasum sha256sum sleep sort stat tail timeout tr uname wc xargs; do
     resolved=$(command -v "$cmd" 2>/dev/null) || continue
     case "$resolved" in /*) ln -sf "$resolved" "$path_dir/$cmd" ;; esac
   done
@@ -827,7 +843,7 @@ test_merged_pr_with_later_local_commit_refuses() {
 test_pr_check_does_not_refresh_stale_pr_head() {
   local case_dir rc pr_head new_head count
   case_dir=$(make_case pr-check-stale)
-  write_meta "$case_dir" no-mistakes ship
+  write_meta "$case_dir" direct-PR ship
   wt_commit_file "$case_dir" feature.txt hello "add feature"
   pr_head=$(git -C "$case_dir/wt" rev-parse HEAD)
   add_gh_pr_merged_for_head "$case_dir" "$pr_head"
@@ -863,7 +879,7 @@ test_pr_check_does_not_refresh_stale_pr_head() {
 test_pr_check_records_remote_head_when_local_lags() {
   local case_dir local_head pr_head
   case_dir=$(make_case pr-check-local-lags)
-  write_meta "$case_dir" no-mistakes ship
+  write_meta "$case_dir" direct-PR ship
   wt_commit_file "$case_dir" feature.txt hello "add feature"
   local_head=$(git -C "$case_dir/wt" rev-parse HEAD)
   pr_head=$(commit_tree_from_wt_head "$case_dir" "$local_head" "no-mistakes follow-up")
@@ -1727,7 +1743,8 @@ SH
     HOME_STATE="$home/state" OWNER_PID="$$" bash -c '
     export FM_STATE_OVERRIDE="$HOME_STATE"
     . "$ROOT/bin/fm-wake-lib.sh"
-    fm_lock_try_acquire "$LOCK" || exit 1
+    fm_control_lock_acquire_bounded "$HOME_STATE" child-b \
+      fm-teardown.test.sh 1 0 || exit 1
     : > "$READY"
     while [ ! -e "$RELEASE" ] && kill -0 "$OWNER_PID" 2>/dev/null; do sleep 0.1; done
     fm_lock_release "$LOCK"
@@ -2062,6 +2079,25 @@ land_shippable_commit() {
   git -C "$case_dir/project" fetch -q origin
 }
 
+test_normal_teardown_skips_inactive_no_mistakes() {
+  local case_dir rc head
+  case_dir=$(make_case inactive-run-skipped)
+  write_meta "$case_dir" no-mistakes ship
+  land_shippable_commit "$case_dir"
+  head=$(git -C "$case_dir/wt" rev-parse HEAD)
+
+  rc=0
+  FM_FAKE_AXI_STATUS="$(parked_axi_status_toon fm/task-x1 "$head")" \
+  FM_FAKE_NM_CALL_LOG="$case_dir/nm-calls.log" \
+  FM_FAKE_NM_ABORT_LOG="$case_dir/nm-abort.log" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "inactive-run-skipped: normal teardown should succeed"
+  assert_absent "$case_dir/nm-calls.log" \
+    "inactive-run-skipped: normal teardown invoked inactive no-mistakes compatibility"
+  pass "normal teardown never invokes inactive no-mistakes compatibility"
+}
+
 test_parked_own_run_is_aborted_before_teardown() {
   local case_dir rc head
   case_dir=$(make_case parked-run-abort)
@@ -2072,6 +2108,7 @@ test_parked_own_run_is_aborted_before_teardown() {
   local rc=0
   FM_FAKE_AXI_STATUS="$(parked_axi_status_toon fm/task-x1 "$head")" \
   FM_FAKE_NM_ABORT_LOG="$case_dir/nm-abort.log" \
+  FM_INACTIVE_NO_MISTAKES_COMPAT=1 \
     run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
 
   expect_code 0 "$rc" "parked-run-abort: teardown should still succeed"
@@ -2095,6 +2132,7 @@ test_mismatched_run_after_abort_refuses_unconfirmed() {
   FM_FAKE_AXI_STATUS="$(parked_axi_status_toon fm/task-x1 "$head" 01RUN)" \
   FM_FAKE_AXI_STATUS_AFTER_ABORT="$(parked_axi_status_toon fm/task-x1 "$head" 02RUN)" \
   FM_FAKE_NM_ABORT_LOG="$case_dir/nm-abort.log" \
+  FM_INACTIVE_NO_MISTAKES_COMPAT=1 \
     run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
 
   expect_code 1 "$rc" "parked-run-replaced: a different run does not confirm the targeted abort"
@@ -2115,6 +2153,7 @@ test_empty_status_after_abort_refuses_unconfirmed() {
   FM_FAKE_AXI_STATUS="$(parked_axi_status_toon fm/task-x1 "$head")" \
   FM_FAKE_NM_ABORT_LOG="$case_dir/nm-abort.log" \
   FM_FAKE_NM_EMPTY_AFTER_ABORT=1 \
+  FM_INACTIVE_NO_MISTAKES_COMPAT=1 \
     run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
 
   expect_code 1 "$rc" "parked-run-empty-confirmation: empty status should refuse"
@@ -2133,6 +2172,7 @@ test_not_found_status_after_abort_confirms_completion() {
   FM_FAKE_AXI_STATUS="$(parked_axi_status_toon fm/task-x1 "$head")" \
   FM_FAKE_NM_ABORT_LOG="$case_dir/nm-abort.log" \
   FM_FAKE_NM_NOT_FOUND_AFTER_ABORT=1 \
+  FM_INACTIVE_NO_MISTAKES_COMPAT=1 \
     run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
 
   expect_code 0 "$rc" "parked-run-not-found-confirmation: explicit not-found should confirm completion"
@@ -2159,6 +2199,7 @@ EOF
   FM_FAKE_AXI_STATUS="$(parked_axi_status_toon fm/task-x1 "$head")" \
   FM_FAKE_NM_ABORT_LOG="$case_dir/nm-abort.log" \
   FM_FAKE_NM_ABORT_NOOP=1 \
+  FM_INACTIVE_NO_MISTAKES_COMPAT=1 \
     run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
 
   expect_code 1 "$rc" "parked-run-abort-unconfirmed: teardown should refuse"
@@ -2187,6 +2228,7 @@ test_another_branchs_parked_run_is_never_touched() {
   # teardown.
   FM_FAKE_AXI_STATUS="$(parked_axi_status_toon fm/some-other-task deadbeef)" \
   FM_FAKE_NM_ABORT_LOG="$case_dir/nm-abort.log" \
+  FM_INACTIVE_NO_MISTAKES_COMPAT=1 \
     run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
 
   expect_code 0 "$rc" "parked-run-not-ours: teardown should still succeed"
@@ -2207,6 +2249,7 @@ test_own_autonomous_run_is_left_alone() {
   rc=0
   FM_FAKE_AXI_STATUS="$(running_axi_status_toon fm/task-x1 "$head")" \
   FM_FAKE_NM_ABORT_LOG="$case_dir/nm-abort.log" \
+  FM_INACTIVE_NO_MISTAKES_COMPAT=1 \
     run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
 
   expect_code 0 "$rc" "autonomous-run-left-alone: teardown should still succeed"
@@ -2592,6 +2635,7 @@ EOF
   rc=0
   FM_FAKE_AXI_STATUS="$(parked_axi_status_toon fm/task-x1 "$head")" \
   FM_FAKE_NM_ABORT_LOG="$abort_log" \
+  FM_INACTIVE_NO_MISTAKES_COMPAT=1 \
     run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   expect_code 0 "$rc" "abort-then-reap-then-remove-order: teardown should still succeed"
   kill -0 "$pid" 2>/dev/null && { kill -KILL "$pid" 2>/dev/null || true; }
@@ -2647,6 +2691,7 @@ test_persistent_index_lock_exhausts_retries_and_refuses_loudly
 test_empty_retry_wait_uses_default_without_aborting
 test_fractional_legacy_retry_wait_refuses_without_arithmetic_error
 test_parked_own_run_is_aborted_before_teardown
+test_normal_teardown_skips_inactive_no_mistakes
 test_parked_own_run_refuses_when_abort_is_unconfirmed
 test_mismatched_run_after_abort_refuses_unconfirmed
 test_empty_status_after_abort_refuses_unconfirmed

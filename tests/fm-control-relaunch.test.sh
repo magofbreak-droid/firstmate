@@ -118,6 +118,7 @@ SH
   cat > "$fb/sleep" <<'SH'
 #!/usr/bin/env bash
 [ -z "${FM_FAKE_LOCK_WAITING:-}" ] || : > "$FM_FAKE_LOCK_WAITING"
+[ -z "${FM_FAKE_REAL_SLEEP:-}" ] || exec /bin/sleep "$@"
 exit 0
 SH
   chmod +x "$fb/sleep"
@@ -136,9 +137,9 @@ new_case() {
   printf '%s\n' "$dir"
 }
 
-# add_ship_task <case-dir> <id> [harness]
+# add_ship_task <case-dir> <id> [harness] [mode]
 add_ship_task() {
-  local dir=$1 id=$2 harness=${3:-claude}
+  local dir=$1 id=$2 harness=${3:-claude} mode=${4:-direct-PR}
   local home="$dir/home" proj="$dir/proj" wt="$dir/wt"
   fm_git_worktree "$proj" "$wt" "task-$id"
   mkdir -p "$home/data/$id"
@@ -150,7 +151,7 @@ add_ship_task() {
     echo "project=$proj"
     echo "harness=$harness"
     echo "kind=ship"
-    echo "mode=no-mistakes"
+    echo "mode=$mode"
     echo "yolo=off"
     echo "tasktmp=/tmp/fm-$id"
     echo "model=default"
@@ -679,6 +680,8 @@ test_secondmate_relaunch_picks_up_the_configured_harness_pin() {
   printf 'codex' > "$dir/fake/becomes"
   out=$(run_control "$dir" sm3 relaunch); rc=$?
   expect_code 0 "$rc" "a configured secondmate harness should relaunch"$'\n'"$out"
+  assert_not_contains "$out" "another lifecycle action is already running" \
+    "the replacement spawn must reuse its fm-control parent ownership"
   [ "$(journal_field "$dir" sm3 to_harness)" = codex ] \
     || fail "a secondmate relaunch should pick up the configured harness pin, got '$(journal_field "$dir" sm3 to_harness)'"
   [ "$(journal_field "$dir" sm3 to_model)" = some-model ] \
@@ -686,7 +689,7 @@ test_secondmate_relaunch_picks_up_the_configured_harness_pin() {
   [ "$(journal_field "$dir" sm3 to_effort)" = high ] \
     || fail "the configured effort token should come with the pin"
   assert_not_contains "$out" "not a verified harness" "codex is a verified harness"
-  pass "fm-control relaunch: a secondmate relaunch re-resolves its durable configured harness pin"
+  pass "fm-control relaunch: a local secondmate reuses parent ownership and re-resolves its harness pin"
 }
 
 test_secondmate_relaunch_ignores_invalid_configured_effort_before_stop() {
@@ -997,6 +1000,7 @@ test_prepublication_failure_keeps_concurrent_durable_metadata() {
     fail "relaunch did not reach its pre-publication endpoint check"
   }
   link_out=$(env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_FAKE_REAL_SLEEP=1 \
     "$X_LINK" rl30 request-30 --carry-count 2 --carry-ts 1700000000 \
       --carry-platform x --carry-max 280 2>&1); rc=$?
   expect_code 0 "$rc" "concurrent durable metadata publication should succeed"$'\n'"$link_out"
@@ -1220,6 +1224,90 @@ SH
   pass "fm-control relaunch: unreadable and untraversable child state fails checkpoint"
 }
 
+test_control_lock_is_typed_and_migrates_legacy_owners_safely() {
+  local dir state id=rl46 lock typed holder_pid owner out rc=0
+  dir=$(new_case typed-control "$id")
+  state="$dir/home/state"
+  add_ship_task "$dir" "$id" claude
+  lock="$state/.control-$id.lock"
+  typed=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1/bin/fm-wake-lib.sh"
+    lock=$(fm_control_lock_path "$2" "$3") || exit 1
+    generic_rc=0
+    fm_lock_try_acquire "$lock" || generic_rc=$?
+    [ "$generic_rc" -eq 2 ] || exit 2
+    fm_control_lock_acquire_bounded "$2" "$3" \
+      fm-control-relaunch.test.sh 1 0 || exit 3
+    printf "expected=%s identity=%s\n" \
+      "$(cat "$lock/expected-command")" "$(cat "$lock/pid-identity")"
+    fm_lock_release "$lock"
+  ' _ "$ROOT" "$state" "$id") \
+    || fail "the shared control boundary did not publish typed ownership"
+  assert_contains "$typed" "expected=fm-control-relaunch.test.sh identity=" \
+    "the shared control boundary did not bind the writer command"
+  printf '%s\n' "$typed" | grep -Eq 'identity=[0-9a-f]{64}$' \
+    || fail "the shared control boundary did not bind process-start identity: $typed"
+
+  sleep 30 &
+  holder_pid=$!
+  owner="$lock.owner.reused"
+  mkdir "$owner"
+  printf '%s\n' "$holder_pid" > "$owner/pid"
+  printf '%s\n' sleep > "$owner/expected-command"
+  printf '%064d\n' 0 > "$owner/pid-identity"
+  chmod 0600 "$owner/pid" "$owner/expected-command" "$owner/pid-identity"
+  ln -s "$owner" "$lock"
+
+  out=$(run_control "$dir" "$id" interrupt) || rc=$?
+  kill -0 "$holder_pid" 2>/dev/null \
+    || fail "the PID-reuse fixture process exited unexpectedly"
+  kill "$holder_pid" 2>/dev/null || true
+  wait "$holder_pid" 2>/dev/null || true
+  expect_code 0 "$rc" "control should recover an identity-mismatched reused PID"$'\n'"$out"
+  [ ! -e "$lock" ] && [ ! -L "$lock" ] \
+    || fail "reused-PID recovery left the control lock held"
+
+  sleep 30 &
+  holder_pid=$!
+  owner="$lock.owner.legacy-reused"
+  mkdir "$owner"
+  printf '%s\n' "$holder_pid" > "$owner/pid"
+  chmod 0600 "$owner/pid"
+  ln -s "$owner" "$lock"
+
+  rc=0
+  out=$(run_control "$dir" "$id" interrupt) || rc=$?
+  kill -0 "$holder_pid" 2>/dev/null \
+    || fail "the legacy PID-reuse fixture process exited unexpectedly"
+  kill "$holder_pid" 2>/dev/null || true
+  wait "$holder_pid" 2>/dev/null || true
+  expect_code 0 "$rc" "control should migrate a legacy lock whose live PID belongs to another command"$'\n'"$out"
+  [ ! -e "$lock" ] && [ ! -L "$lock" ] \
+    || fail "legacy PID-reuse recovery left the control lock held"
+
+  bash -c '/bin/sleep 30; :' fm-control.sh &
+  holder_pid=$!
+  owner="$lock.owner.legacy-control"
+  mkdir "$owner"
+  printf '%s\n' "$holder_pid" > "$owner/pid"
+  chmod 0600 "$owner/pid"
+  ln -s "$owner" "$lock"
+
+  rc=0
+  out=$(run_control "$dir" "$id" interrupt) || rc=$?
+  kill -0 "$holder_pid" 2>/dev/null \
+    || fail "the genuine legacy control owner exited unexpectedly"
+  kill "$holder_pid" 2>/dev/null || true
+  wait "$holder_pid" 2>/dev/null || true
+  expect_code 1 "$rc" "control should preserve a live legacy lifecycle owner"
+  assert_contains "$out" "another lifecycle action is already running" \
+    "the preserved legacy owner should produce the ordinary contention refusal"
+  [ -L "$lock" ] || fail "a live legacy lifecycle owner was reclaimed"
+  rm -f "$lock"
+  rm -rf "$owner"
+  pass "control ownership safely migrates typed and legacy PID-reuse records"
+}
+
 test_concurrent_relaunch_is_refused() {
   local dir out rc lock holder i
   dir=$(new_case lock rl19)
@@ -1230,7 +1318,8 @@ test_concurrent_relaunch_is_refused() {
   (
     # shellcheck source=/dev/null
     . "$ROOT/bin/fm-wake-lib.sh"
-    fm_lock_try_acquire "$lock" || exit 1
+    fm_control_lock_acquire_bounded "$dir/home/state" rl19 \
+      fm-control-relaunch.test.sh 1 0 || exit 1
     sleep 30
   ) &
   holder=$!
@@ -1260,7 +1349,8 @@ test_direct_spawn_relaunch_participates_in_the_lifecycle_lock() {
   lock="$dir/home/state/.control-rl26.lock"
   (
     . "$ROOT/bin/fm-wake-lib.sh"
-    fm_lock_try_acquire "$lock" || exit 1
+    fm_control_lock_acquire_bounded "$dir/home/state" rl26 \
+      fm-control-relaunch.test.sh 1 0 || exit 1
     sleep 30
   ) &
   holder=$!
@@ -1287,7 +1377,8 @@ test_promotion_participates_in_the_lifecycle_lock_before_metadata_resolution() {
   lock="$dir/home/state/.control-rl29.lock"
   (
     . "$ROOT/bin/fm-wake-lib.sh"
-    fm_lock_try_acquire "$lock" || exit 1
+    fm_control_lock_acquire_bounded "$dir/home/state" rl29 \
+      fm-control-relaunch.test.sh 1 0 || exit 1
     sleep 30
   ) &
   holder=$!
@@ -1307,7 +1398,25 @@ test_promotion_participates_in_the_lifecycle_lock_before_metadata_resolution() {
   pass "fm-promote: promotion participates in lifecycle serialization"
 }
 
-# --- 6. fm-spawn --relaunch's own refusals -----------------------------------
+# --- 6. relaunch boundary refusals -------------------------------------------
+
+test_relaunch_refuses_a_retired_delivery_mode() {
+  local dir out rc
+  dir=$(new_case retired-mode rl42)
+  add_ship_task "$dir" rl42 claude no-mistakes
+  out=$(run_control "$dir" rl42 relaunch --note "continue from the preserved copy"); rc=$?
+  expect_code 1 "$rc" "control relaunching a retired delivery mode should refuse"
+  assert_contains "$out" "no-mistakes is retired; use direct-PR" \
+    "the control refusal should name the active delivery replacement"
+  [ ! -s "$dir/fake/literal" ] || fail "retired-mode control relaunch touched the running agent"
+  printf 'zsh' > "$dir/fake/command"
+  out=$(run_spawn "$dir" rl42 --relaunch --harness claude); rc=$?
+  expect_code 1 "$rc" "directly relaunching a retired delivery mode should refuse"
+  assert_contains "$out" "no-mistakes is retired; use direct-PR" \
+    "the launch-owner refusal should name the active delivery replacement"
+  [ ! -s "$dir/fake/literal" ] || fail "retired-mode relaunch attempted to launch a replacement"
+  pass "relaunch: retired delivery modes are refused before stop and replacement launch"
+}
 
 test_spawn_relaunch_refuses_a_live_agent() {
   local dir out rc
@@ -1516,9 +1625,11 @@ test_journal_records_the_checkpoint_it_proved
 test_secondmate_relaunch_checkpoints_child_work_and_spares_the_charter
 test_secondmate_relaunch_refuses_an_unmarked_home
 test_secondmate_checkpoint_refuses_unreadable_child_state
+test_control_lock_is_typed_and_migrates_legacy_owners_safely
 test_concurrent_relaunch_is_refused
 test_direct_spawn_relaunch_participates_in_the_lifecycle_lock
 test_promotion_participates_in_the_lifecycle_lock_before_metadata_resolution
+test_relaunch_refuses_a_retired_delivery_mode
 test_spawn_relaunch_refuses_a_live_agent
 test_spawn_relaunch_refuses_a_symlinked_task_record_before_inspection
 test_spawn_relaunch_keeps_its_early_meta_lock_continuous

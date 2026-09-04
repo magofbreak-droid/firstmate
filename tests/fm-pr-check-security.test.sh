@@ -22,11 +22,6 @@ REAL_CP=$(command -v cp)
 REAL_MV=$(command -v mv)
 REAL_STAT=$(command -v stat)
 REAL_CHMOD=$(command -v chmod)
-# The merge path reads a merge request's JSON with the real jq, and BASE_PATH is
-# deliberately restricted, so a case that needs jq exposes this one rather than
-# depending on the host keeping jq in one of those four directories.
-REAL_JQ=$(command -v jq) || fail "these tests read glab's JSON with the real jq, which was not found"
-
 ack_watcher_cycle() {  # <state>
   local state=$1 err sequence generation
   err="$state/.test-wake-drain.err"
@@ -47,14 +42,185 @@ file_mode() {
   fi
 }
 
-process_is_live_non_zombie() {
-  local pid=$1 stat
-  kill -0 "$pid" 2>/dev/null || return 1
-  stat=$(ps -p "$pid" -o stat= 2>/dev/null || true)
-  case "$stat" in
-    Z*) return 1 ;;
-  esac
-  return 0
+# Inactive migration compatibility fixtures retained on disk for legacy
+# quarantine evidence; the active suite below owns current PR-check behavior.
+# shellcheck disable=SC2329
+state_snapshot() {
+  local state=$1 file
+  (
+    cd "$state" || exit 1
+    find . \( -type f -o -type l \) -print | LC_ALL=C sort | while IFS= read -r file; do
+      if [ -L "$file" ]; then
+        printf 'link %s %s\n' "$file" "$(readlink "$file")"
+      else
+        printf 'file %s %s ' "$file" "$(file_mode "$file")"
+        shasum -a 256 "$file" | awk '{print $1}'
+      fi
+    done
+  )
+}
+
+# shellcheck disable=SC2329
+make_case() {
+  local name=$1 dir fakebin fake_root
+  dir="$TMP_ROOT/$name"
+  fakebin="$dir/fakebin"
+  fake_root="$dir/root"
+  mkdir -p "$dir/home/state" "$dir/home/data" "$dir/home/config" "$dir/wt" "$fakebin" "$fake_root/bin"
+  cat > "$fake_root/bin/fm-guard.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'guard\n' >> "$FM_TEST_GUARD_LOG"
+SH
+  chmod +x "$fake_root/bin/fm-guard.sh"
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_TEST_GH_LOG"
+case " $* " in
+  *"/branches/"*"/protection"*)
+    printf 'require\trequired\tnone\tVerify exact PR head\tnone\tnone\t15368\tnone\n'
+    ;;
+  *"/rules/branches/"*) ;;
+  *"/check-runs?"*)
+    [ -z "${FM_TEST_GH_CHECK_STARTED:-}" ] || : > "$FM_TEST_GH_CHECK_STARTED"
+    [ "${FM_TEST_GH_CHECK_SLEEP:-0}" = 0 ] || sleep "$FM_TEST_GH_CHECK_SLEEP"
+    printf 'result\tcheck\t%s\tVerify exact PR head\tcompleted\tsuccess\t15368\tgithub-actions\n' \
+      "${FM_TEST_GH_CHECK_HEAD:-${FM_TEST_GH_HEAD:-0123456789abcdef0123456789abcdef01234567}}"
+    ;;
+  *"/status?"*) ;;
+  *" baseRefName "*) printf '%s\n' main ;;
+  *" state,headRefOid "*)
+    [ -z "${FM_TEST_GH_POLL_STARTED:-}" ] || : > "$FM_TEST_GH_POLL_STARTED"
+    if [ -n "${FM_TEST_GH_POLL_RELEASE:-}" ]; then
+      while [ ! -e "$FM_TEST_GH_POLL_RELEASE" ]; do sleep 0.01; done
+    fi
+    [ "${FM_TEST_GH_SLEEP:-0}" = 0 ] || sleep "$FM_TEST_GH_SLEEP"
+    printf '%s\t%s\n' "${FM_TEST_GH_STATE:-OPEN}" "${FM_TEST_GH_HEAD:-0123456789abcdef0123456789abcdef01234567}"
+    ;;
+  *" headRefOid "*)
+    [ -z "${FM_TEST_GH_HEAD_READ:-}" ] || : > "$FM_TEST_GH_HEAD_READ"
+    printf '%s\n' "${FM_TEST_GH_HEAD:-0123456789abcdef0123456789abcdef01234567}"
+    ;;
+  *" state "*)
+    [ "${FM_TEST_GH_FAIL:-0}" = 0 ] || exit 1
+    [ -z "${FM_TEST_GH_POLL_STARTED:-}" ] || : > "$FM_TEST_GH_POLL_STARTED"
+    [ "${FM_TEST_GH_SLEEP:-0}" = 0 ] || sleep "$FM_TEST_GH_SLEEP"
+    printf '%s\n' "${FM_TEST_GH_STATE:-OPEN}"
+    ;;
+esac
+SH
+  cat > "$fakebin/gh-axi" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_TEST_GH_AXI_LOG"
+exit "${FM_TEST_GH_AXI_RC:-0}"
+SH
+  # The glab sentinel records any forbidden call from the inactive provider.
+  cat > "$fakebin/glab" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_TEST_GLAB_LOG"
+[ "${FM_TEST_GLAB_FAIL:-0}" = 0 ] || exit 1
+[ "${FM_TEST_GLAB_SLEEP:-0}" = 0 ] || sleep "$FM_TEST_GLAB_SLEEP"
+printf 'title:\tfixture merge request\nstate:\t%s\nauthor:\tsomeone\n' "${FM_TEST_GLAB_STATE:-opened}"
+SH
+  chmod +x "$fakebin/gh" "$fakebin/gh-axi" "$fakebin/glab"
+  : > "$dir/gh.log"
+  : > "$dir/gh-axi.log"
+  : > "$dir/glab.log"
+  : > "$dir/guard.log"
+  printf '%s\n' "$dir"
+}
+
+# shellcheck disable=SC2329
+write_task_meta() {
+  local dir=$1 id=${2:-task-a}
+  fm_write_meta "$dir/home/state/$id.meta" \
+    "window=firstmate:fm-$id" \
+    "endpoint_task_id=$id" \
+    "worktree=$dir/wt" \
+    "project=$dir/project" \
+    "kind=ship" \
+    "mode=direct-PR"
+}
+
+# shellcheck disable=SC2329
+write_poll_meta() {
+  local state=$1 id=$2 url=$3 head=${4:-0123456789abcdef0123456789abcdef01234567}
+  fm_write_meta "$state/$id.meta" \
+    "window=fm-$id" \
+    "mode=direct-PR" \
+    "pr=$url" \
+    "pr_head=$head" \
+    "pr_green_head=$head"
+}
+
+write_ambiguous_poll() {
+  local dir=$1 id=${2:-task-a}
+  fm_write_meta "$dir/home/state/$id.meta" \
+    "window=fm-$id" \
+    'pr=https://github.com/o/r/pull/10' \
+    'window=unexpected-after-pr'
+  printf 'legacy ambiguous bytes\n' > "$dir/home/state/$id.check.sh"
+}
+
+write_v1_x_shim() {
+  local file=$1 home=$2 root=$3
+  fmx_poll_shim_v1_content "$home" "$root" > "$file"
+}
+
+write_manual_poll_pair() {
+  local state=$1 url=${2:-https://github.com/o/r/pull/10} provider host path number
+  local head=0123456789abcdef0123456789abcdef01234567
+  fm_pr_url_parse "$url" || fail "manual poll fixture URL was invalid"
+  provider=$FM_PR_PROVIDER
+  host=$FM_PR_HOST
+  path=$FM_PR_PATH
+  number=$FM_PR_NUMBER
+  cp "$POLL" "$state/task-a.check.sh"
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$provider" "$url" "$host" "$path" "$number" "$head" > "$state/task-a.pr-poll"
+  chmod 0600 "$state/task-a.check.sh" "$state/task-a.pr-poll"
+}
+
+start_ambiguous_pending_repair() {
+  local dir=$1 state rc
+  state="$dir/home/state"
+  write_ambiguous_poll "$dir"
+  mkdir "$state/task-a.pr-poll"
+  set +e
+  FM_HOME="$dir/home" PATH="$BASE_PATH" "$MIGRATE" >/dev/null 2>/dev/null
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "ambiguous pending-repair fixture unexpectedly completed"
+  rmdir "$state/task-a.pr-poll"
+  write_poll_meta "$state" task-a https://github.com/o/r/pull/10
+  [ -f "$state/.pr-check-quarantine/task-a.diagnostic.pending-ambiguous" ] \
+    || fail "ambiguous pending-repair fixture lost its pending obligation"
+}
+
+write_watcher_lock() {
+  local state=$1 home=$2 pid=$3 identity
+  rm -rf "$state/.watch.lock"
+  mkdir "$state/.watch.lock"
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$ROOT/bin/fm-wake-lib.sh" "$pid")
+  [ -n "$identity" ] || fail "could not capture fake older-watcher identity"
+  printf '%s\n' "$pid" > "$state/.watch.lock/pid"
+  printf '%s\n' "$home" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+}
+
+assert_valid_migration_marker() {
+  local marker=$1
+  [ -f "$marker" ] && [ ! -L "$marker" ] || fail "migration success did not publish an ordinary marker"
+  [ "$(file_mode "$marker")" = 600 ] || fail "migration marker mode was not 0600"
+  grep -qxF fm-pr-check-migration-v1 "$marker" || fail "migration marker bytes were not exact"
+  [ "$(awk 'END { print NR + 0 }' "$marker")" -eq 1 ] || fail "migration marker had extra records"
+}
+
+assert_valid_scan_marker() {
+  local marker=$1
+  [ -f "$marker" ] && [ ! -L "$marker" ] || fail "migration success did not publish an ordinary scan marker"
+  [ "$(file_mode "$marker")" = 600 ] || fail "migration scan marker mode was not 0600"
+  grep -qxF fm-pr-check-migration-scan-v1 "$marker" || fail "migration scan marker bytes were not exact"
+  [ "$(awk 'END { print NR + 0 }' "$marker")" -eq 1 ] || fail "migration scan marker had extra records"
 }
 
 LINK_KIND=
@@ -141,12 +307,37 @@ case "${1:-} ${2:-}" in
       'state=MERGED' \
       'merged=true' \
       'queued=false' \
-      'base=main'
+      'base=main' \
+      'auto=false' \
+      "head=${FM_TEST_GH_HEAD:-0123456789abcdef0123456789abcdef01234567}"
     exit 0
     ;;
 esac
 case " $* " in
-  *" headRefOid "*) printf '%s\n' "${FM_TEST_GH_HEAD:-0123456789abcdef0123456789abcdef01234567}" ;;
+  *"/branches/"*"/protection"*)
+    printf 'require\trequired\tnone\tVerify exact PR head\tnone\tnone\t15368\tnone\n'
+    ;;
+  *"/rules/branches/"*) ;;
+  *"/check-runs?"*)
+    [ -z "${FM_TEST_GH_CHECK_STARTED:-}" ] || : > "$FM_TEST_GH_CHECK_STARTED"
+    [ "${FM_TEST_GH_CHECK_SLEEP:-0}" = 0 ] || sleep "$FM_TEST_GH_CHECK_SLEEP"
+    printf 'result\tcheck\t%s\tVerify exact PR head\tcompleted\tsuccess\t15368\tgithub-actions\n' \
+      "${FM_TEST_GH_CHECK_HEAD:-${FM_TEST_GH_HEAD:-0123456789abcdef0123456789abcdef01234567}}"
+    ;;
+  *"/status?"*) ;;
+  *" baseRefName "*) printf '%s\n' main ;;
+  *" state,headRefOid "*)
+    [ -z "${FM_TEST_GH_POLL_STARTED:-}" ] || : > "$FM_TEST_GH_POLL_STARTED"
+    if [ -n "${FM_TEST_GH_POLL_RELEASE:-}" ]; then
+      while [ ! -e "$FM_TEST_GH_POLL_RELEASE" ]; do sleep 0.01; done
+    fi
+    [ "${FM_TEST_GH_SLEEP:-0}" = 0 ] || sleep "$FM_TEST_GH_SLEEP"
+    printf '%s\t%s\n' "${FM_TEST_GH_STATE:-OPEN}" "${FM_TEST_GH_HEAD:-0123456789abcdef0123456789abcdef01234567}"
+    ;;
+  *" headRefOid "*)
+    [ -z "${FM_TEST_GH_HEAD_READ:-}" ] || : > "$FM_TEST_GH_HEAD_READ"
+    printf '%s\n' "${FM_TEST_GH_HEAD:-0123456789abcdef0123456789abcdef01234567}"
+    ;;
   *" state "*)
     [ "${FM_TEST_GH_FAIL:-0}" = 0 ] || exit 1
     [ "${FM_TEST_GH_SLEEP:-0}" = 0 ] || sleep "$FM_TEST_GH_SLEEP"
@@ -158,15 +349,26 @@ SH
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_GH_AXI_LOG"
 case "${1:-} ${2:-}" in
+  "pr checks")
+    printf '%s\n' 'summary: 1 passed, 0 failed, 1 total'
+    printf '%s\n' 'checks[1]{name,conclusion}:'
+    printf '%s\n' '  Verify exact PR head,pass'
+    ;;
   "pr view")
     [ "$#" -eq 5 ] && [ "${4:-}" = --repo ] || exit 2
     printf 'pull_request:\n  number: %s\n  state: %s\n' "$3" "${FM_TEST_GH_MERGE_STATE:-merged}"
     ;;
+  "pr merge")
+    if [ -n "${FM_TEST_GH_MERGE_STARTED:-}" ]; then
+      : > "$FM_TEST_GH_MERGE_STARTED"
+      while [ ! -e "$FM_TEST_GH_MERGE_RELEASE" ]; do sleep 0.01; done
+    fi
+    printf 'merged:\n  number: %s\n  status: ok\n' "${3:-}"
+    ;;
 esac
 exit "${FM_TEST_GH_AXI_RC:-0}"
 SH
-  # Plain glab, reproducing the real CLI's contract: its field output on stdout
-  # and exit 0 on success, and a non-zero exit with no stdout on any failure.
+  # The glab sentinel records any forbidden call from the inactive provider.
   cat > "$fakebin/glab" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_GLAB_LOG"
@@ -190,14 +392,17 @@ write_task_meta() {
     "worktree=$dir/wt" \
     "project=$dir/project" \
     "kind=ship" \
-    "mode=no-mistakes"
+    "mode=direct-PR"
 }
 
 write_poll_meta() {
-  local state=$1 id=$2 url=$3
+  local state=$1 id=$2 url=$3 head=${4:-0123456789abcdef0123456789abcdef01234567}
   fm_write_meta "$state/$id.meta" \
     "window=fm-$id" \
-    "pr=$url"
+    "mode=direct-PR" \
+    "pr=$url" \
+    "pr_head=$head" \
+    "pr_green_head=$head"
 }
 
 
@@ -205,8 +410,11 @@ run_check_entry() {
   local dir=$1
   shift
   FM_ROOT_OVERRIDE="$dir/root" FM_HOME="$dir/home" \
-    FM_TEST_GUARD_LOG="$dir/guard.log" FM_TEST_GH_LOG="$dir/gh.log" \
+  FM_TEST_GUARD_LOG="$dir/guard.log" FM_TEST_GH_LOG="$dir/gh.log" \
     FM_TEST_GH_AXI_LOG="$dir/gh-axi.log" FM_TEST_GLAB_LOG="$dir/glab.log" \
+    FM_PR_CI_ATTEMPTS=1 FM_PR_CI_INTERVAL=0 \
+    FM_PR_LIFECYCLE_LOCK_ATTEMPTS="${FM_PR_LIFECYCLE_LOCK_ATTEMPTS:-50}" \
+    FM_PR_LIFECYCLE_LOCK_INTERVAL="${FM_PR_LIFECYCLE_LOCK_INTERVAL:-0.1}" \
     PATH="$dir/fakebin:$BASE_PATH" \
     "$PR_CHECK" "$@"
 }
@@ -217,6 +425,8 @@ run_merge_entry() {
   FM_ROOT_OVERRIDE="$dir/root" FM_HOME="$dir/home" \
     FM_TEST_GUARD_LOG="$dir/guard.log" FM_TEST_GH_LOG="$dir/gh.log" \
     FM_TEST_GH_AXI_LOG="$dir/gh-axi.log" FM_TEST_GLAB_LOG="$dir/glab.log" \
+    FM_PR_LIFECYCLE_LOCK_ATTEMPTS="${FM_PR_LIFECYCLE_LOCK_ATTEMPTS:-50}" \
+    FM_PR_LIFECYCLE_LOCK_INTERVAL="${FM_PR_LIFECYCLE_LOCK_INTERVAL:-0.1}" \
     PATH="$dir/fakebin:$BASE_PATH" \
     "$PR_MERGE" "$@"
 }
@@ -505,7 +715,7 @@ test_valid_recording_and_merge_derivation() {
   fm_pr_poll_artifacts_valid "$dir/home/state" task-a "$POLL" \
     || fail "published poll provenance or metadata binding was invalid"
   sidecar=$(cat "$dir/home/state/task-a.pr-poll")
-  [ "$sidecar" = $'github\nhttps://github.com/my-org/repo_name.with-dots/pull/37\ngithub.com\nmy-org/repo_name.with-dots\n37' ] \
+  [ "$sidecar" = $'github\nhttps://github.com/my-org/repo_name.with-dots/pull/37\ngithub.com\nmy-org/repo_name.with-dots\n37\n0123456789abcdef0123456789abcdef01234567' ] \
     || fail "published sidecar bytes were not exact"
 
   FM_TEST_GH_HEAD=$expected run_check_entry "$dir" task-a https://github.com/my-org/repo_name.with-dots/pull/37 \
@@ -518,7 +728,7 @@ test_valid_recording_and_merge_derivation() {
   : > "$dir/gh-axi.log"
   run_merge_entry "$dir" task-a https://github.com/my-org/repo_name.with-dots/pull/37 -- --merge \
     >/dev/null 2>/dev/null || fail "valid merge wrapper failed"
-  grep -qxF 'pr merge 37 --repo my-org/repo_name.with-dots --merge' "$dir/gh-axi.log" \
+  grep -qxF 'pr merge 37 --repo my-org/repo_name.with-dots --match-head-commit 0123456789abcdef0123456789abcdef01234567 --merge' "$dir/gh-axi.log" \
     || fail "merge wrapper did not preserve repository derivation and method"
   # A merge this home performed leaves its own durable outcome, so the poll's
   # confirmation is no longer the first the captain hears of it. Acknowledge that
@@ -544,17 +754,25 @@ test_valid_recording_and_merge_derivation() {
 
   dir=$(make_case newline-head)
   write_task_meta "$dir"
+  set +e
   FM_TEST_GH_HEAD=$'0123456789abcdef0123456789abcdef01234567\nwindow=unexpected' \
-    run_check_entry "$dir" task-a https://github.com/o/r/pull/2 >/dev/null 2>/dev/null \
-    || fail "valid check with malformed remote head failed"
+    run_check_entry "$dir" task-a https://github.com/o/r/pull/2 >"$dir/stdout" 2>"$dir/stderr"
+  rc=$?
+  set -e
+  [ "$rc" -eq 1 ] || fail "malformed remote head did not refuse exact-head registration"
+  assert_grep 'could not resolve the exact GitHub PR head' "$dir/stderr" \
+    "malformed remote head refusal was not explicit"
+  assert_no_grep '^pr=' "$dir/home/state/task-a.meta" "malformed remote head published PR metadata"
   assert_no_grep 'pr_head=' "$dir/home/state/task-a.meta" "multiline PR head reached metadata"
   assert_no_grep 'window=unexpected' "$dir/home/state/task-a.meta" "newline metadata key was injected"
+  assert_absent "$dir/home/state/task-a.check.sh" "malformed remote head published a check"
+  assert_absent "$dir/home/state/task-a.pr-poll" "malformed remote head published a poll"
 
   dir=$(make_case lifecycle-compatible-id)
   write_task_meta "$dir" Task_A.1
   run_merge_entry "$dir" Task_A.1 https://github.com/o/r/pull/3 \
     > "$dir/stdout" 2> "$dir/stderr" \
-    || fail "safe lifecycle-compatible task ID could not use the PR merge flow"
+    || fail "safe lifecycle-compatible task ID could not use the PR merge flow: $(cat "$dir/stderr")"
   fm_pr_poll_artifacts_valid "$dir/home/state" Task_A.1 "$POLL" \
     || fail "safe lifecycle-compatible task ID did not publish an authenticated poll"
   rm -rf "$dir/wt"
@@ -578,7 +796,7 @@ SH
       "worktree=$dir/missing-worktree" \
       "project=$dir/project" \
       'kind=ship' \
-      'mode=local-only'
+      'mode=direct-PR'
     cat > "$dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 exit 0
@@ -601,11 +819,13 @@ SH
       --carry-count 0 --carry-ts 1700000000 --carry-platform x --carry-max 280 \
       > "$dir/x-link.out" 2> "$dir/x-link.err" \
       || fail "path-safe legacy task ID could not link an X request"
+    mkdir -p "$dir/missing-worktree"
     run_merge_entry "$dir" "$id" https://github.com/o/r/pull/4 \
       > "$dir/merge.out" 2> "$dir/merge.err" \
-      || fail "path-safe legacy task ID could not use the PR merge flow"
+      || fail "path-safe legacy task ID could not use the PR merge flow: $(cat "$dir/merge.err")"
     fm_pr_poll_artifacts_valid "$dir/home/state" "$id" "$POLL" \
       || fail "path-safe legacy task ID did not publish an authenticated poll"
+    rmdir "$dir/missing-worktree"
     FM_HOME="$dir/home" FM_ROOT_OVERRIDE="$ROOT" PATH="$dir/fakebin:$BASE_PATH" \
       "$TEARDOWN" "$id" --force > "$dir/teardown.out" 2> "$dir/teardown.err" \
       || fail "legacy path-safe task ID could not be torn down"
@@ -619,6 +839,11 @@ run_watcher_bounded() {
   shift 2
   perl -e 'my $pid=fork; die unless defined $pid; if (!$pid) { exec @ARGV } local $SIG{ALRM}=sub { kill "TERM", $pid; waitpid $pid, 0; exit 124 }; alarm 10; waitpid $pid, 0; alarm 0; exit($? >> 8)' \
     env FM_HOME="$home" FM_ROOT_OVERRIDE="$watch_root" FM_CHECK_INTERVAL="$check_interval" FM_CHECK_TIMEOUT=1 \
+      FM_TEST_GH_HEAD="${FM_TEST_GH_HEAD:-}" FM_TEST_GH_STATE="${FM_TEST_GH_STATE:-}" \
+      FM_TEST_GH_SLEEP="${FM_TEST_GH_SLEEP:-0}" FM_TEST_GH_POLL_STARTED="${FM_TEST_GH_POLL_STARTED:-}" \
+      FM_TEST_GH_POLL_RELEASE="${FM_TEST_GH_POLL_RELEASE:-}" \
+      FM_PR_LIFECYCLE_LOCK_ATTEMPTS="${FM_PR_LIFECYCLE_LOCK_ATTEMPTS:-50}" \
+      FM_PR_LIFECYCLE_LOCK_INTERVAL="${FM_PR_LIFECYCLE_LOCK_INTERVAL:-0.1}" \
       FM_POLL=0.02 FM_HEARTBEAT=999999 FM_SIGNAL_GRACE=0 PATH="$fakebin:$BASE_PATH" "$WATCH" "$@"
 }
 
@@ -642,7 +867,7 @@ test_rejected_metacharacter_bytes_are_inert() {
     [ "$rc" -ne 0 ] || fail "rejected metacharacter byte was accepted"
     [ ! -e "$dir/home/state/task-a.check.sh" ] || fail "rejected input left a runnable task check"
     [ ! -e "$dir/home/state/task-a.pr-poll" ] || fail "rejected input left a sidecar"
-    fm_pr_poll_prepare "$dir/home/state" safe-check github https://github.com/o/r/pull/99 github.com o/r 99 "$POLL" \
+    fm_pr_poll_prepare "$dir/home/state" safe-check github https://github.com/o/r/pull/99 github.com o/r 99 0123456789abcdef0123456789abcdef01234567 "$POLL" \
       || fail "could not prepare bounded watcher poll"
     fm_pr_poll_publish_prepared || fail "could not publish bounded watcher poll"
 
@@ -670,8 +895,9 @@ test_rejected_metacharacter_bytes_are_inert() {
 make_poll_fixture() {
   local dir=$1
   cp "$POLL" "$dir/home/state/task-a.check.sh"
-  printf '%s\n%s\n%s\n%s\n%s\n' \
-    github https://github.com/o/r/pull/1 github.com o/r 1 > "$dir/home/state/task-a.pr-poll"
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
+    github https://github.com/o/r/pull/1 github.com o/r 1 \
+    0123456789abcdef0123456789abcdef01234567 > "$dir/home/state/task-a.pr-poll"
   chmod 0600 "$dir/home/state/task-a.check.sh" "$dir/home/state/task-a.pr-poll"
 }
 
@@ -698,6 +924,8 @@ test_static_poll_contract() {
   done
   out=$(FM_TEST_GH_STATE=MERGED run_poll "$dir")
   [ "$out" = merged ] || fail "static poll did not emit exactly one merged line"
+  out=$(FM_TEST_GH_STATE=MERGED FM_TEST_GH_HEAD=1111111111111111111111111111111111111111 run_poll "$dir")
+  [ -z "$out" ] || fail "static poll emitted for a merged different head"
   out=$(FM_TEST_GH_FAIL=1 run_poll "$dir")
   [ -z "$out" ] || fail "static poll emitted after gh failure"
 
@@ -705,10 +933,10 @@ test_static_poll_contract() {
   out=$(run_poll "$dir")
   [ -z "$out" ] || fail "static poll emitted with missing sidecar"
   mv "$dir/home/state/task-a.pr-poll.missing" "$dir/home/state/task-a.pr-poll"
-  printf '%s\n%s\n%s\n%s\n%s\n%s\n' github https://github.com/o/r/pull/1 github.com o/r 1 extra > "$dir/home/state/task-a.pr-poll"
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' github https://github.com/o/r/pull/1 github.com o/r 1 0123456789abcdef0123456789abcdef01234567 extra > "$dir/home/state/task-a.pr-poll"
   out=$(FM_TEST_GH_STATE=MERGED run_poll "$dir")
   [ -z "$out" ] || fail "static poll emitted with multiline sidecar"
-  printf '%s\n%s\n%s\n%s\n%s\n' github https://github.com/o/r/pull/1x github.com o/r 1x > "$dir/home/state/task-a.pr-poll"
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n' github https://github.com/o/r/pull/1x github.com o/r 1x 0123456789abcdef0123456789abcdef01234567 > "$dir/home/state/task-a.pr-poll"
   out=$(FM_TEST_GH_STATE=MERGED run_poll "$dir")
   [ -z "$out" ] || fail "static poll emitted with malformed numeric data"
 
@@ -723,7 +951,7 @@ test_static_poll_contract() {
   [ -z "$out" ] || fail "timed-out static poll emitted output"
 
   write_poll_meta "$dir/home/state" task-a https://github.com/o/r/pull/1
-  fm_pr_poll_prepare "$dir/home/state" task-a github https://github.com/o/r/pull/1 github.com o/r 1 "$POLL" \
+  fm_pr_poll_prepare "$dir/home/state" task-a github https://github.com/o/r/pull/1 github.com o/r 1 0123456789abcdef0123456789abcdef01234567 "$POLL" \
     || fail "could not prepare authenticated watcher poll"
   fm_pr_poll_publish_prepared || fail "could not publish authenticated watcher poll"
   rm -f "$dir/home/state/.last-check"
@@ -810,13 +1038,373 @@ SH
   pass "concurrent watchers observe only complete private poll publications"
 }
 
+test_concurrent_pr_checks_preserve_newer_poll() {
+  local dir state head_a head_b pid_a pid_b i
+  dir=$(make_case concurrent-pr-checks)
+  state="$dir/home/state"
+  head_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  head_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  write_task_meta "$dir"
+  cat > "$dir/fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+previous=
+last=
+for argument in "$@"; do
+  previous=$last
+  last=$argument
+done
+if [ "$last" = "$FM_TEST_PR_A_DEST" ] \
+  && grep -qxF "$FM_TEST_PR_A_HEAD" "$previous" 2>/dev/null; then
+  : > "$FM_TEST_PR_A_BLOCK"
+  sleep 1
+fi
+exec "$FM_TEST_REAL_MV" "$@"
+SH
+  chmod +x "$dir/fakebin/mv"
+
+  FM_TEST_REAL_MV="$REAL_MV" FM_TEST_PR_A_DEST="$state/task-a.pr-poll" \
+    FM_TEST_PR_A_HEAD="$head_a" FM_TEST_PR_A_BLOCK="$dir/a-blocked" \
+    FM_TEST_GH_HEAD="$head_a" FM_TEST_GH_CHECK_HEAD="$head_a" \
+    run_check_entry "$dir" task-a https://github.com/o/r/pull/1 \
+      > "$dir/a.out" 2> "$dir/a.err" &
+  pid_a=$!
+  i=0
+  while [ "$i" -lt 200 ] && [ ! -e "$dir/a-blocked" ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  [ "$i" -lt 200 ] || fail "older PR check did not reach its delayed publication"
+
+  FM_TEST_REAL_MV="$REAL_MV" FM_TEST_PR_A_DEST="$state/task-a.pr-poll" \
+    FM_TEST_PR_A_HEAD="$head_a" FM_TEST_PR_A_BLOCK="$dir/a-blocked" \
+    FM_TEST_GH_HEAD="$head_b" FM_TEST_GH_CHECK_HEAD="$head_b" \
+    run_check_entry "$dir" task-a https://github.com/o/r/pull/1 \
+      > "$dir/b.out" 2> "$dir/b.err" &
+  pid_b=$!
+
+  wait "$pid_a" || fail "older concurrent PR check failed: $(cat "$dir/a.err")"
+  wait "$pid_b" || fail "newer concurrent PR check failed: $(cat "$dir/b.err")"
+  fm_pr_poll_artifacts_valid "$state" task-a "$POLL" \
+    || fail "concurrent PR checks left invalid poll provenance"
+  fm_pr_poll_data_parse "$state/task-a.pr-poll" \
+    || fail "concurrent PR checks left unreadable poll data"
+  [ "$FM_PR_DATA_HEAD" = "$head_b" ] \
+    || fail "an older concurrent PR check replaced the newer exact-head poll"
+  grep -qxF "pr_green_head=$head_b" "$state/task-a.meta" \
+    || fail "an older concurrent PR check replaced newer green metadata"
+  pass "same-task PR checks serialize publication without revoking the newer poll"
+}
+
+test_pr_check_refuses_replaced_task_incarnation() {
+  local dir state head pid i rc replacement
+  dir=$(make_case replaced-task-incarnation)
+  state="$dir/home/state"
+  head=cccccccccccccccccccccccccccccccccccccccc
+  replacement="$state/replacement.meta"
+  write_task_meta "$dir"
+
+  FM_TEST_GH_CHECK_STARTED="$dir/check-started" FM_TEST_GH_CHECK_SLEEP=1 \
+    FM_TEST_GH_HEAD="$head" FM_TEST_GH_CHECK_HEAD="$head" \
+    run_check_entry "$dir" task-a https://github.com/o/r/pull/1 \
+      > "$dir/check.out" 2> "$dir/check.err" &
+  pid=$!
+  i=0
+  while [ "$i" -lt 200 ] && [ ! -e "$dir/check-started" ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  [ "$i" -lt 200 ] || fail "PR check did not reach exact-head evidence collection"
+
+  fm_write_meta "$replacement" \
+    'window=firstmate:fm-task-a' \
+    'endpoint_task_id=task-a' \
+    "worktree=$dir/wt" \
+    "project=$dir/project" \
+    'kind=ship' \
+    'mode=direct-PR' \
+    'session_generation=2'
+  chmod 0600 "$replacement"
+  "$REAL_MV" -f -- "$replacement" "$state/task-a.meta"
+  rc=0
+  wait "$pid" || rc=$?
+  [ "$rc" -ne 0 ] || fail "PR check accepted a replaced task incarnation"
+  assert_grep 'task metadata changed during exact-head verification' "$dir/check.err" \
+    "replaced task incarnation refusal was not explicit"
+  grep -qxF 'session_generation=2' "$state/task-a.meta" \
+    || fail "stale PR check replaced the newer task incarnation"
+  assert_absent "$state/task-a.check.sh" "stale PR check published a runnable poll"
+  assert_absent "$state/task-a.pr-poll" "stale PR check published poll data"
+  assert_absent "$state/task-a.pr-poll-registration" "stale PR check published poll registration"
+  pass "PR check publication stays bound to the observed task incarnation"
+}
+
+test_merge_holds_pr_lifecycle_against_concurrent_check() {
+  local dir head_a head_b merge_pid check_pid i
+  dir=$(make_case merge-check-lifecycle-owner)
+  head_a=dddddddddddddddddddddddddddddddddddddddd
+  head_b=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+  write_task_meta "$dir"
+
+  FM_TEST_GH_HEAD="$head_a" FM_TEST_GH_CHECK_HEAD="$head_a" \
+    FM_TEST_GH_MERGE_STARTED="$dir/merge-started" \
+    FM_TEST_GH_MERGE_RELEASE="$dir/merge-release" \
+    run_merge_entry "$dir" task-a https://github.com/o/r/pull/1 \
+      > "$dir/merge.out" 2> "$dir/merge.err" &
+  merge_pid=$!
+  i=0
+  while [ "$i" -lt 200 ] && [ ! -e "$dir/merge-started" ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  [ "$i" -lt 200 ] || fail "merge did not reach its forge operation"
+
+  FM_TEST_GH_HEAD="$head_b" FM_TEST_GH_CHECK_HEAD="$head_b" \
+    FM_TEST_GH_HEAD_READ="$dir/concurrent-check-read" \
+    run_check_entry "$dir" task-a https://github.com/o/r/pull/1 \
+      > "$dir/check.out" 2> "$dir/check.err" &
+  check_pid=$!
+  i=0
+  while [ "$i" -lt 20 ] && [ ! -e "$dir/concurrent-check-read" ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  [ ! -e "$dir/concurrent-check-read" ] \
+    || fail "a concurrent checker entered while the merge lifecycle was in flight"
+
+  : > "$dir/merge-release"
+  wait "$merge_pid" || fail "merge lifecycle owner failed: $(cat "$dir/merge.err")"
+  wait "$check_pid" || fail "checker failed after merge lifecycle release: $(cat "$dir/check.err")"
+  [ -e "$dir/concurrent-check-read" ] \
+    || fail "concurrent checker did not proceed after merge lifecycle release"
+  pass "merge owns the PR lifecycle through its final forge outcome"
+}
+
+test_stale_watcher_cannot_report_republished_poll() {
+  local dir state head_a head_b watcher_pid i rc
+  dir=$(make_case stale-watcher-republished-poll)
+  state="$dir/home/state"
+  head_a=1111111111111111111111111111111111111111
+  head_b=2222222222222222222222222222222222222222
+  write_task_meta "$dir"
+  FM_TEST_GH_HEAD="$head_a" FM_TEST_GH_CHECK_HEAD="$head_a" \
+    run_check_entry "$dir" task-a https://github.com/o/r/pull/1 >/dev/null 2> "$dir/a.err" \
+    || fail "could not seed the watcher A poll: $(cat "$dir/a.err")"
+  rm -f "$state/.last-check"
+  touch "$state/.inactive-outcome-reconcile"
+
+  FM_TEST_GH_STATE=MERGED FM_TEST_GH_HEAD="$head_a" \
+    FM_TEST_GH_POLL_STARTED="$dir/poll-started" \
+    FM_TEST_GH_POLL_RELEASE="$dir/poll-release" \
+    run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/watch.out" 2> "$dir/watch.err" &
+  watcher_pid=$!
+  i=0
+  while [ "$i" -lt 200 ] && [ ! -e "$dir/poll-started" ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  [ "$i" -lt 200 ] || fail "watcher did not capture poll A"
+
+  FM_TEST_GH_HEAD="$head_b" FM_TEST_GH_CHECK_HEAD="$head_b" \
+    run_check_entry "$dir" task-a https://github.com/o/r/pull/1 >/dev/null 2> "$dir/b.err" \
+    || fail "could not republish watcher poll B: $(cat "$dir/b.err")"
+  add_stop_custom_check "$dir"
+  : > "$dir/poll-release"
+  rc=0
+  wait "$watcher_pid" || rc=$?
+  expect_code 0 "$rc" "stale watcher should continue after poll replacement"
+  assert_no_grep '^check: .*task-a.check.sh: merged$' "$dir/watch.out" \
+    "stale watcher reported the replaced poll A"
+  assert_absent "$state/task-a.pr-poll-merge-notified" \
+    "stale watcher recorded a merge outcome for replaced poll A"
+  fm_pr_poll_artifacts_valid "$state" task-a "$POLL" \
+    || fail "stale watcher damaged republished poll B"
+  fm_pr_poll_data_parse "$state/task-a.pr-poll" \
+    || fail "republished poll B was unreadable"
+  [ "$FM_PR_DATA_HEAD" = "$head_b" ] || fail "stale watcher replaced poll B with poll A"
+  pass "stale watcher results cannot cross a republished PR poll"
+}
+
+test_watcher_waits_for_inflight_forge_lifecycle() {
+  local dir state head merge_pid watcher_pid i merge_rc watch_rc blocked
+  dir=$(make_case watcher-forge-lifecycle-owner)
+  state="$dir/home/state"
+  head=3333333333333333333333333333333333333333
+  write_task_meta "$dir"
+
+  FM_TEST_GH_HEAD="$head" FM_TEST_GH_CHECK_HEAD="$head" \
+    FM_TEST_GH_MERGE_STARTED="$dir/merge-started" \
+    FM_TEST_GH_MERGE_RELEASE="$dir/merge-release" \
+    run_merge_entry "$dir" task-a https://github.com/o/r/pull/1 \
+      > "$dir/merge.out" 2> "$dir/merge.err" &
+  merge_pid=$!
+  i=0
+  while [ "$i" -lt 200 ] && [ ! -e "$dir/merge-started" ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  [ "$i" -lt 200 ] || fail "merge did not reach its forge lifecycle"
+  add_stop_custom_check "$dir"
+  rm -f "$state/.last-check"
+  touch "$state/.inactive-outcome-reconcile"
+
+  FM_TEST_GH_STATE=MERGED FM_TEST_GH_HEAD="$head" FM_TEST_GH_POLL_STARTED="$dir/poll-started" \
+    run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/watch.out" 2> "$dir/watch.err" &
+  watcher_pid=$!
+  i=0
+  while [ "$i" -lt 200 ] && [ ! -e "$dir/poll-started" ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  [ "$i" -lt 200 ] \
+    || fail "watcher did not read the in-flight merge poll: $(cat "$dir/watch.err")"
+  sleep 0.2
+  blocked=0
+  kill -0 "$watcher_pid" 2>/dev/null && [ -e "$state/task-a.check.sh" ] && blocked=1
+
+  : > "$dir/merge-release"
+  merge_rc=0
+  wait "$merge_pid" || merge_rc=$?
+  watch_rc=0
+  wait "$watcher_pid" || watch_rc=$?
+  expect_code 0 "$merge_rc" "forge merge should complete under lifecycle ownership"
+  expect_code 0 "$watch_rc" "watcher should complete after forge lifecycle release"
+  [ "$blocked" -eq 1 ] || fail "watcher retired the poll during the in-flight forge merge"
+  assert_poll_absent "$state" task-a
+  pass "watcher retirement waits for the in-flight forge lifecycle"
+}
+
+test_pr_lifecycle_recovers_reused_pid_owner() {
+  local dir state lock owner recovery recovery_owner holder_pid check_pid i rc timed_out
+  dir=$(make_case pr-lifecycle-pid-reuse)
+  state="$dir/home/state"
+  write_task_meta "$dir"
+  sleep 30 &
+  holder_pid=$!
+  lock="$state/.pr-check-task-a.lock"
+  owner="$lock.owner.reused"
+  mkdir "$owner"
+  printf '%s\n' "$holder_pid" > "$owner/pid"
+  printf '%s\n%s\n%s\n%s\n' \
+    fm-pr-lifecycle-v1 check "$holder_pid" \
+    0000000000000000000000000000000000000000000000000000000000000000 \
+    > "$owner/record"
+  chmod 0600 "$owner/pid" "$owner/record"
+  ln -s "$owner" "$lock"
+  recovery="$lock.recovery"
+  recovery_owner="$recovery.owner.reused"
+  mkdir "$recovery_owner"
+  printf '%s\n' "$holder_pid" > "$recovery_owner/pid"
+  printf '%s\n' fm-pr-check.sh > "$recovery_owner/expected-command"
+  printf '%064d\n' 0 > "$recovery_owner/pid-identity"
+  chmod 0600 "$recovery_owner/pid" "$recovery_owner/expected-command" \
+    "$recovery_owner/pid-identity"
+  ln -s "$recovery_owner" "$recovery"
+
+  FM_PR_LIFECYCLE_LOCK_ATTEMPTS=5 FM_PR_LIFECYCLE_LOCK_INTERVAL=0.01 \
+    run_check_entry "$dir" task-a https://github.com/o/r/pull/1 \
+      > "$dir/check.out" 2> "$dir/check.err" &
+  check_pid=$!
+  timed_out=0
+  i=0
+  while kill -0 "$check_pid" 2>/dev/null && [ "$i" -lt 200 ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  if kill -0 "$check_pid" 2>/dev/null; then
+    timed_out=1
+    kill -TERM "$check_pid" 2>/dev/null || true
+  fi
+  rc=0
+  wait "$check_pid" || rc=$?
+  [ "$timed_out" -eq 0 ] || rc=124
+  kill -0 "$holder_pid" 2>/dev/null || fail "PID-reuse fixture process exited unexpectedly"
+  kill "$holder_pid" 2>/dev/null || true
+  wait "$holder_pid" 2>/dev/null || true
+
+  expect_code 0 "$rc" "PR lifecycle should recover an unrelated reused PID owner"
+  fm_pr_poll_artifacts_valid "$state" task-a "$POLL" \
+    || fail "PID-reuse recovery did not publish a valid PR poll"
+  [ ! -e "$lock" ] && [ ! -L "$lock" ] || fail "PID-reuse recovery left the lifecycle lock held"
+  [ ! -e "$recovery" ] && [ ! -L "$recovery" ] \
+    || fail "PID-reuse recovery left the lifecycle recovery claim held"
+  pass "PR lifecycle ownership rejects PID reuse without wedging delivery"
+}
+
+test_pr_metadata_lock_recovers_reused_pid_owner() {
+  local dir state meta lock owner holder_pid out sibling
+  dir=$(make_case pr-metadata-pid-reuse)
+  state="$dir/home/state"
+  meta="$state/task-a.meta"
+  write_task_meta "$dir"
+  sibling=$(FM_HOME="$dir/home" FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1/bin/fm-pr-lifecycle-lock-lib.sh"
+    lock=$(fm_meta_lock_path "$2") || exit 1
+    fm_lock_try_create "$lock"
+    [ "$?" -eq 2 ] || exit 2
+    fm_lock_try_acquire "$lock"
+    [ "$?" -eq 2 ] || exit 3
+    fm_lock_acquire_wait "$lock"
+    [ "$?" -eq 2 ] || exit 4
+    [ ! -e "$lock" ] && [ ! -L "$lock" ] || exit 5
+    fm_process_command_identity() { return 1; }
+    rc=0
+    fm_meta_lock_acquire_bounded "$2" fm-captain-hold.sh 1 0 2>/dev/null || rc=$?
+    [ "$rc" -eq 1 ] || exit 6
+    [ ! -e "$lock" ] && [ ! -L "$lock" ] \
+      && [ ! -e "$lock.steal" ] && [ ! -L "$lock.steal" ] || exit 7
+    fm_process_command_identity() { printf "%064d\n" 1; }
+    fm_meta_lock_acquire_bounded "$2" fm-captain-hold.sh 1 0 || exit 8
+    printf "expected=%s identity=%s\n" \
+      "$(cat "$lock/expected-command")" "$(cat "$lock/pid-identity")"
+    fm_lock_release "$lock"
+  ' fm-captain-hold.sh "$ROOT" "$meta") \
+    || fail "legacy generic lock APIs admitted untyped task metadata ownership"
+  case "$sibling" in
+    expected=fm-captain-hold.sh\ identity=0000000000000000000000000000000000000000000000000000000000000001) ;;
+    *) fail "sibling metadata writer did not publish typed command ownership: $sibling" ;;
+  esac
+  sleep 30 &
+  holder_pid=$!
+  lock="$state/.meta-task-a.lock"
+  owner="$lock.owner.reused"
+  mkdir "$owner"
+  printf '%s\n' "$holder_pid" > "$owner/pid"
+  printf '%s\n' fm-captain-hold.sh > "$owner/expected-command"
+  printf '%064d\n' 0 > "$owner/pid-identity"
+  chmod 0600 "$owner/pid" "$owner/expected-command" "$owner/pid-identity"
+  ln -s "$owner" "$lock"
+  out=$(FM_HOME="$dir/home" FM_STATE_OVERRIDE="$state" \
+    FM_PR_LIFECYCLE_LOCK_ATTEMPTS=2 FM_PR_LIFECYCLE_LOCK_INTERVAL=0 \
+    bash -c '
+      . "$1/bin/fm-pr-lifecycle-lock-lib.sh"
+      fm_process_command_identity() { printf "%064d\n" 1; }
+      fm_pr_lifecycle_metadata_lock_acquire "$2" check || exit 1
+      lock=$(fm_meta_lock_path "$2") || exit 1
+      printf "expected=%s identity=%s\n" \
+        "$(cat "$lock/expected-command")" "$(cat "$lock/pid-identity")"
+      fm_lock_release "$lock"
+    ' fm-pr-check.sh "$ROOT" "$meta") \
+    || fail "PR metadata lock did not recover a reused PID owner"
+  kill -0 "$holder_pid" 2>/dev/null \
+    || fail "PR metadata PID-reuse fixture process exited unexpectedly"
+  kill "$holder_pid" 2>/dev/null || true
+  wait "$holder_pid" 2>/dev/null || true
+  case "$out" in
+    expected=fm-pr-check.sh\ identity=0000000000000000000000000000000000000000000000000000000000000001) ;;
+    *) fail "PR metadata lock did not publish typed command ownership: $out" ;;
+  esac
+  [ ! -e "$lock" ] && [ ! -L "$lock" ] \
+    || fail "PR metadata PID-reuse recovery left its lock held"
+  pass "sibling metadata ownership is typed, bounded, and PID-reuse safe"
+}
+
 test_poll_publication_refuses_unsafe_destinations() {
   local artifact kind dir state destination
   for artifact in task-a.pr-poll task-a.pr-poll-registration task-a.check.sh; do
     for kind in regular dangling directory; do
       dir=$(make_case "poll-path-${artifact//./-}-$kind")
       state="$dir/home/state"
-      fm_pr_poll_prepare "$state" task-a github https://github.com/o/r/pull/1 github.com o/r 1 "$POLL" \
+      fm_pr_poll_prepare "$state" task-a github https://github.com/o/r/pull/1 github.com o/r 1 0123456789abcdef0123456789abcdef01234567 "$POLL" \
         || fail "could not stage poll symlink refusal fixture"
       destination="$state/$artifact"
       make_private_symlink "$dir" "$destination" "$kind"
@@ -831,7 +1419,7 @@ test_poll_publication_refuses_unsafe_destinations() {
 
     dir=$(make_case "poll-path-${artifact//./-}-direct-directory")
     state="$dir/home/state"
-    fm_pr_poll_prepare "$state" task-a github https://github.com/o/r/pull/1 github.com o/r 1 "$POLL" \
+    fm_pr_poll_prepare "$state" task-a github https://github.com/o/r/pull/1 github.com o/r 1 0123456789abcdef0123456789abcdef01234567 "$POLL" \
       || fail "could not stage poll directory refusal fixture"
     destination="$state/$artifact"
     mkdir "$destination"
@@ -967,11 +1555,11 @@ test_postrename_poll_validation_revokes_and_retries() {
       dir=$(make_case "poll-final-$artifact-$action")
       state="$dir/home/state"
       write_poll_meta "$state" task-a https://github.com/o/r/pull/1
-      fm_pr_poll_prepare "$state" task-a github https://github.com/o/r/pull/1 github.com o/r 1 "$POLL" \
+      fm_pr_poll_prepare "$state" task-a github https://github.com/o/r/pull/1 github.com o/r 1 0123456789abcdef0123456789abcdef01234567 "$POLL" \
         || fail "could not prepare prior poll"
       fm_pr_poll_publish_prepared || fail "could not publish prior poll"
       write_poll_meta "$state" task-a https://github.com/o/r/pull/2
-      fm_pr_poll_prepare "$state" task-a github https://github.com/o/r/pull/2 github.com o/r 2 "$POLL" \
+      fm_pr_poll_prepare "$state" task-a github https://github.com/o/r/pull/2 github.com o/r 2 0123456789abcdef0123456789abcdef01234567 "$POLL" \
         || fail "could not stage replacement poll"
       case "$artifact" in
         data) destination="$state/task-a.pr-poll" ;;
@@ -994,7 +1582,7 @@ test_postrename_poll_validation_revokes_and_retries() {
       [ "$(cat "$link_target")" = 'external sentinel' ] || fail "poll type fault changed an external target"
       [ "$(file_mode "$link_target")" = 644 ] || fail "poll type fault changed an external target mode"
 
-      fm_pr_poll_prepare "$state" task-a github https://github.com/o/r/pull/2 github.com o/r 2 "$POLL" \
+      fm_pr_poll_prepare "$state" task-a github https://github.com/o/r/pull/2 github.com o/r 2 0123456789abcdef0123456789abcdef01234567 "$POLL" \
         || fail "could not prepare poll retry"
       PATH="$BASE_PATH" fm_pr_poll_publish_prepared || fail "poll retry did not recover after final validation fault"
       fm_pr_poll_artifacts_valid "$state" task-a "$POLL" || fail "poll retry did not publish a valid pair"
@@ -1143,11 +1731,11 @@ SH
     child_pid=$(cat "$child_pid_file")
     kill -TERM "$watcher_pid" 2>/dev/null || fail "could not stop $backend watcher"
     i=0
-    while process_is_live_non_zombie "$watcher_pid" && [ "$i" -lt 150 ]; do
+    while kill -0 "$watcher_pid" 2>/dev/null && [ "$i" -lt 150 ]; do
       sleep 0.02
       i=$((i + 1))
     done
-    if process_is_live_non_zombie "$watcher_pid"; then
+    if kill -0 "$watcher_pid" 2>/dev/null; then
       kill -KILL "$watcher_pid" 2>/dev/null || true
       wait "$watcher_pid" 2>/dev/null || true
       kill -KILL "$child_pid" 2>/dev/null || true
@@ -1157,7 +1745,7 @@ SH
     wait "$watcher_pid" || rc=$?
     [ "$rc" -ne 0 ] || fail "$backend signaled watcher exited successfully"
     alive=0
-    process_is_live_non_zombie "$child_pid" && alive=1
+    kill -0 "$child_pid" 2>/dev/null && alive=1
     [ "$alive" -eq 0 ] || kill -KILL "$child_pid" 2>/dev/null || true
     wait "$child_pid" 2>/dev/null || true
     [ "$alive" -eq 0 ] || fail "$backend watcher left a returned check descendant alive"
@@ -1210,7 +1798,9 @@ SH
     "project=$dir/project" \
     'kind=ship' \
     'mode=local-only' \
-    'pr=https://github.com/o/r/pull/18'
+    'pr=https://github.com/o/r/pull/18' \
+    'pr_head=0123456789abcdef0123456789abcdef01234567' \
+    'pr_green_head=0123456789abcdef0123456789abcdef01234567'
   seed_canonical_poll "$dir" task-a https://github.com/o/r/pull/18
   fm_pr_poll_snapshot_capture "$dir/home/state" task-a "$POLL" \
     || fail "could not snapshot teardown receipt fixture"
@@ -1273,132 +1863,65 @@ SH
   pass "teardown removes safe poll artifacts and refuses directory-shaped check files without traversal"
 }
 
-# The GitLab watch must follow a merge request exactly as the GitHub watch
-# follows a pull request, on any instance, and must never turn an unreadable
-# merge request into a merge. Its evidence against the public fixture project
-# https://gitlab.com/KarotKris/gitlab-merge-watch-fixture is in
-# docs/gitlab-merge-watch.md; this exercises the same paths hermetically.
-test_gitlab_merge_watch() {
-  local dir state out rc url value noglab entry bindir name
-  dir=$(make_case gitlab-merge-watch)
+# GitLab URL parsing remains only to recognize legacy records, while every
+# active check, poll, and merge boundary refuses or stays silent before a CLI.
+test_gitlab_delivery_is_inactive() {
+  local dir state out rc url
+  dir=$(make_case gitlab-delivery-inactive)
   state="$dir/home/state"
   url=https://gitlab.example/group/subgroup/project/-/merge_requests/7
 
-  write_poll_meta "$state" task-a "$url"
-  fm_pr_poll_prepare "$state" task-a gitlab "$url" gitlab.example group/subgroup/project 7 "$POLL" \
-    || fail "could not prepare a GitLab poll"
-  fm_pr_poll_publish_prepared || fail "could not publish a GitLab poll"
-  fm_pr_poll_artifacts_valid "$state" task-a "$POLL" \
-    || fail "published GitLab poll provenance or metadata binding was invalid"
-  [ "$(cat "$state/task-a.pr-poll")" = "gitlab
-$url
-gitlab.example
-group/subgroup/project
-7" ] || fail "published GitLab sidecar bytes were not exact"
+  fm_pr_url_parse "$url" || fail "inactive GitLab identity was no longer recognizable"
+  [ "$FM_PR_PROVIDER" = gitlab ] || fail "inactive GitLab identity lost its provider tag"
+  fm_pr_poll_prepare "$state" task-a gitlab "$url" gitlab.example group/subgroup/project 7 0123456789abcdef0123456789abcdef01234567 "$POLL" \
+    && fail "inactive GitLab delivery prepared a new poll"
+  [ ! -e "$state/task-a.pr-poll" ] || fail "refused GitLab poll preparation left an artifact"
 
-  # Only an exact merged state wakes firstmate. Every other reading, including
-  # an unreadable merge request and a changed output format, stays silent.
-  for value in opened closed locked '' not-a-state MERGED merged-but-not; do
-    out=$(FM_TEST_GLAB_STATE="$value" run_poll "$dir")
-    [ -z "$out" ] || fail "GitLab poll emitted for a non-merged state"
-  done
-  out=$(FM_TEST_GLAB_STATE=merged run_poll "$dir")
-  [ "$out" = merged ] || fail "GitLab poll did not emit exactly one merged line"
-  out=$(FM_TEST_GLAB_FAIL=1 run_poll "$dir")
-  [ -z "$out" ] || fail "GitLab poll emitted after a glab failure"
+  : > "$dir/glab.log"
+  out=$(FM_TEST_GLAB_STATE=merged FM_TEST_GLAB_LOG="$dir/glab.log" \
+    PATH="$dir/fakebin:$BASE_PATH" "$POLL" --validated \
+      gitlab "$url" gitlab.example group/subgroup/project 7 0123456789abcdef0123456789abcdef01234567)
+  [ -z "$out" ] || fail "inactive GitLab poll emitted a merged result"
+  [ ! -s "$dir/glab.log" ] || fail "inactive GitLab poll invoked glab"
 
-  # glab is addressed by project URL and merge request number, never by the
-  # merge request URL, which the real CLI resolves through the current git
-  # repository the watcher does not have.
-  grep -qF -- "mr view 7 -R https://gitlab.example/group/subgroup/project" "$dir/glab.log" \
-    || fail "GitLab poll did not address glab by project URL and merge request number"
-  ! grep -qF -- "$url" "$dir/glab.log" \
-    || fail "GitLab poll passed a merge request URL to glab"
-
-  # An absent CLI must produce no wake rather than a false merge. The whole
-  # search path is mirrored without glab, because a real glab anywhere on
-  # PATH would make this prove nothing.
-  noglab="$dir/noglab"
-  mkdir -p "$noglab"
-  while IFS= read -r bindir; do
-    [ -d "$bindir" ] || continue
-    for entry in "$bindir"/*; do
-      [ -e "$entry" ] || continue
-      name=$(basename "$entry")
-      [ "$name" = glab ] && continue
-      [ -e "$noglab/$name" ] || ln -s "$entry" "$noglab/$name" 2>/dev/null
-    done
-  done <<EOF
-$dir/fakebin
-$(printf '%s\n' "$BASE_PATH" | tr ':' '\n')
-EOF
-  ! PATH="$noglab" command -v glab >/dev/null 2>&1 \
-    || fail "the glab-free search path still resolved glab"
-  out=$(FM_TEST_GLAB_STATE=merged FM_TEST_GH_LOG="$dir/gh.log" FM_TEST_GLAB_LOG="$dir/glab.log" \
-    PATH="$noglab" \
-    bash "$state/task-a.check.sh")
-  [ -z "$out" ] || fail "GitLab poll emitted with glab absent from PATH"
-
-  # A doctored sidecar cannot redirect the poll: the stored parts must rebuild
-  # the stored URL exactly.
-  printf '%s\n%s\n%s\n%s\n%s\n' gitlab "$url" elsewhere.example group/subgroup/project 7 \
-    > "$state/task-a.pr-poll"
-  out=$(FM_TEST_GLAB_STATE=merged run_poll "$dir")
-  [ -z "$out" ] || fail "GitLab poll emitted for a sidecar whose host was swapped"
-  printf '%s\n%s\n%s\n%s\n%s\n' gitlab "$url" gitlab.example group/subgroup/other 7 \
-    > "$state/task-a.pr-poll"
-  out=$(FM_TEST_GLAB_STATE=merged run_poll "$dir")
-  [ -z "$out" ] || fail "GitLab poll emitted for a sidecar whose project was swapped"
-
-  # Arming is where a missing CLI can still be reported, so it refuses there.
   write_task_meta "$dir" task-b
   set +e
   out=$(FM_ROOT_OVERRIDE="$dir/root" FM_HOME="$dir/home" \
-    FM_TEST_GUARD_LOG="$dir/guard.log" PATH="$noglab" \
+    FM_TEST_GUARD_LOG="$dir/guard.log" PATH="$dir/fakebin:$BASE_PATH" \
     "$PR_CHECK" task-b "$url" 2>&1)
   rc=$?
   set -e
-  [ "$rc" -ne 0 ] || fail "arming a GitLab watch succeeded with glab absent"
-  case "$out" in
-    *"requires glab on PATH"*) ;;
-    *) fail "arming a GitLab watch with glab absent did not report the missing CLI" ;;
-  esac
-  [ ! -e "$state/task-b.check.sh" ] || fail "refused GitLab arming left a poll armed"
+  [ "$rc" -ne 0 ] || fail "inactive GitLab delivery armed a check"
+  assert_contains "$out" "GitLab PR delivery is inactive migration compatibility" \
+    "GitLab check refusal did not name its inactive compatibility status"
+  [ ! -e "$state/task-b.check.sh" ] || fail "refused GitLab check left a poll armed"
 
-  # The merge path addresses the forge the URL names, and never the other one.
-  # This fixture's glab answers with the field output the poll reads, so the
-  # merge's JSON read cannot be parsed, which must refuse rather than merge on a
-  # state it could not read.
   write_task_meta "$dir" task-c
-  : > "$dir/glab.log"
-  # The merge path needs jq before it reads anything, so this case supplies it
-  # and the refusal below is the unreadable state rather than a missing tool.
-  ln -sf "$REAL_JQ" "$dir/fakebin/jq"
+  : > "$dir/gh-axi.log"
   set +e
   run_merge_entry "$dir" task-c "$url" >/dev/null 2> "$dir/merge-c.err"
   rc=$?
   set -e
-  [ "$rc" -ne 0 ] || fail "merge wrapper merged a GitLab merge request it could not read"
-  grep -qF 'could not read the GitLab merge request state before merging' "$dir/merge-c.err" \
-    || fail "merge wrapper refused for some reason other than the state it could not read"
-  [ ! -s "$dir/gh-axi.log" ] || fail "merge wrapper reached the GitHub CLI for a GitLab URL"
-  grep -qF "mr view 7 -R https://gitlab.example/group/subgroup/project" "$dir/glab.log" \
-    || fail "merge wrapper did not read the merge request through glab at its own instance"
-  ! grep -qF ' mr merge ' "$dir/glab.log" \
-    || fail "merge wrapper merged despite an unreadable merge request state"
+  [ "$rc" -ne 0 ] || fail "inactive GitLab delivery reached merge"
+  assert_grep 'GitLab PR delivery is inactive migration compatibility' "$dir/merge-c.err" \
+    "GitLab merge refusal did not name its inactive compatibility status"
+  [ ! -s "$dir/glab.log" ] || fail "inactive GitLab merge invoked glab"
+  [ ! -s "$dir/gh-axi.log" ] || fail "inactive GitLab merge invoked gh-axi"
 
-  pass "GitLab merge requests are followed on any instance and never wake falsely"
+  pass "GitLab identities remain recognizable but checking, polling, and merging are inactive"
 }
 
 seed_canonical_poll() {
-  local dir=$1 id=$2 url=$3 template=${4:-$POLL} state provider host path number
+  local dir=$1 id=$2 url=$3 template=${4:-$POLL} state provider host path number head
   state="$dir/home/state"
   fm_pr_url_parse "$url" || fail "retirement fixture URL was invalid"
   provider=$FM_PR_PROVIDER
   host=$FM_PR_HOST
   path=$FM_PR_PATH
   number=$FM_PR_NUMBER
-  fm_pr_poll_prepare "$state" "$id" "$provider" "$url" "$host" "$path" "$number" "$template" \
+  head=$(sed -n 's/^pr_green_head=//p' "$state/$id.meta")
+  fm_pr_head_valid "$head" || fail "retirement fixture metadata had no exact green head"
+  fm_pr_poll_prepare "$state" "$id" "$provider" "$url" "$host" "$path" "$number" "$head" "$template" \
     || fail "could not prepare retirement fixture"
   fm_pr_poll_publish_prepared || fail "could not publish retirement fixture"
 }
@@ -1408,8 +1931,8 @@ add_stop_custom_check() {
   state="$dir/home/state"
   printf '#!/usr/bin/env bash\nprintf "stop-cycle\\n"\n' > "$state/z-stop.check.sh"
   chmod 0700 "$state/z-stop.check.sh"
-  FM_HOME="$dir/home" "$REGISTER" z-stop >/dev/null \
-    || fail "could not register stop-cycle custom check"
+  FM_HOME="$dir/home" "$REGISTER" z-stop >/dev/null 2> "$dir/stop-register.err" \
+    || fail "could not register stop-cycle custom check: $(cat "$dir/stop-register.err")"
 }
 
 assert_poll_absent() {
@@ -1759,7 +2282,8 @@ test_persistent_secondmate_retirement_is_poll_only() {
     'backend=tmux' \
     "home=$dir/secondmate-home" \
     'pr=https://github.com/o/r/pull/2' \
-    'pr_head=0123456789abcdef0123456789abcdef01234567'
+    'pr_head=0123456789abcdef0123456789abcdef01234567' \
+    'pr_green_head=0123456789abcdef0123456789abcdef01234567'
   mkdir -p "$dir/secondmate-home"
   printf 'working: persistent endpoint remains healthy\n' > "$state/domain.status"
   printf -- '- domain | scope: test | home: %s\n' "$dir/secondmate-home" > "$dir/home/data/secondmates.md"
@@ -2103,26 +2627,23 @@ test_retirement_queue_failure_and_receipt_tampering() {
   pass "queue failure and untrusted receipts preserve canonical poll evidence"
 }
 
-test_gitlab_merged_poll_retires() {
-  local dir state url rc
-  dir=$(make_case gitlab-merged-retirement)
-  state="$dir/home/state"
-  url=https://gitlab.example/group/subgroup/project/-/merge_requests/17
-  write_poll_meta "$state" task-a "$url"
-  seed_canonical_poll "$dir" task-a "$url"
-  set +e
-  FM_TEST_GLAB_STATE=merged run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/watch.out" 2> "$dir/watch.err"
-  rc=$?
-  set -e
-  [ "$rc" -eq 0 ] || fail "GitLab merged retirement watcher failed: $(cat "$dir/watch.err")"
-  case "$(cat "$dir/watch.out")" in check:*task-a.check.sh:*merged) ;; *) fail "GitLab merged wake was missing" ;; esac
-  assert_poll_absent "$state" task-a
-  grep -qxF "pr=$url" "$state/task-a.meta" || fail "GitLab retirement removed canonical metadata"
-  pass "GitHub and GitLab exact merged results share one retirement path"
-}
+case "${FM_TEST_FOCUS:-}" in
+  pr-lifecycle-review)
+    test_stale_watcher_cannot_report_republished_poll
+    test_watcher_waits_for_inflight_forge_lifecycle
+    test_pr_lifecycle_recovers_reused_pid_owner
+    test_pr_metadata_lock_recovers_reused_pid_owner
+    echo "# focused PR lifecycle review tests passed"
+    exit 0
+    ;;
+  pr-lifecycle-stale) test_stale_watcher_cannot_report_republished_poll; exit 0 ;;
+  pr-lifecycle-forge) test_watcher_waits_for_inflight_forge_lifecycle; exit 0 ;;
+  pr-lifecycle-pid) test_pr_lifecycle_recovers_reused_pid_owner; exit 0 ;;
+  pr-metadata-pid) test_pr_metadata_lock_recovers_reused_pid_owner; exit 0 ;;
+esac
 
 test_parser_matrix
-test_gitlab_merge_watch
+test_gitlab_delivery_is_inactive
 test_merged_poll_retires_once
 test_merged_poll_reregistration_after_notification_is_absorbed
 test_merged_poll_retries_a_failed_upward_report
@@ -2134,13 +2655,19 @@ test_retirement_crash_recovery
 test_external_merge_transition_retires_only_terminal_poll
 test_retirement_refuses_replacement_and_nonterminal_results
 test_retirement_queue_failure_and_receipt_tampering
-test_gitlab_merged_poll_retires
 test_invalid_entrypoints_have_zero_side_effects
 test_valid_recording_and_merge_derivation
 test_rejected_metacharacter_bytes_are_inert
 test_static_poll_contract
 test_atomic_interruption_leaves_no_partial_artifact
 test_concurrent_watcher_sees_only_complete_publication
+test_concurrent_pr_checks_preserve_newer_poll
+test_pr_check_refuses_replaced_task_incarnation
+test_merge_holds_pr_lifecycle_against_concurrent_check
+test_stale_watcher_cannot_report_republished_poll
+test_watcher_waits_for_inflight_forge_lifecycle
+test_pr_lifecycle_recovers_reused_pid_owner
+test_pr_metadata_lock_recovers_reused_pid_owner
 test_poll_publication_refuses_unsafe_destinations
 test_live_artifact_single_link_and_privacy_validation
 test_postrename_poll_validation_revokes_and_retries

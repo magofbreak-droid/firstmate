@@ -145,7 +145,7 @@ run_spawn() {
       FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
       FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$pane" TMUX=fake,1,0 \
       PATH="$fakebin:$PATH" "$@" \
-      "$SPAWN" "$id" "$proj" codex --mode no-mistakes --yolo off ) 2>&1
+      "$SPAWN" "$id" "$proj" codex --mode direct-PR --yolo off ) 2>&1
 }
 
 test_spawn_refuses_and_admits() {
@@ -305,7 +305,7 @@ SH
   fm_write_meta "$case_dir/state/task-x1.meta" \
     "window=firstmate:fm-task-x1" "endpoint_task_id=task-x1" \
     "worktree=$case_dir/wt" "project=$case_dir/project" \
-    "kind=ship" "mode=no-mistakes" "spawn_gen=spawn-gate-refuse-task-x1"
+    "kind=ship" "mode=direct-PR" "spawn_gen=spawn-gate-refuse-task-x1"
   touch "$case_dir/state/.last-watcher-beat"
   printf '%s\n' "$case_dir"
 }

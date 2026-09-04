@@ -29,11 +29,17 @@ fm_current_pid() {
 }
 
 fm_pid_alive() {
-  local pid=$1
+  local pid=$1 err
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
-  kill -0 "$pid" 2>/dev/null
+  if err=$(LC_ALL=C kill -0 "$pid" 2>&1); then
+    return 0
+  fi
+  case "$err" in
+    *'Operation not permitted'*|*'operation not permitted'*) return 0 ;;
+  esac
+  return 1
 }
 
 fm_pid_identity() {
@@ -300,6 +306,7 @@ fm_lock_clean_known_files() {
     "$lockdir/pid" \
     "$lockdir/fm-home" \
     "$lockdir/pid-identity" \
+    "$lockdir/expected-command" \
     "$lockdir/role" \
     "$lockdir/watcher-path" \
     2>/dev/null || true
@@ -337,12 +344,25 @@ fm_lock_owner_dir() {
   mktemp -d "${lock_abs}.owner.XXXXXX" 2>/dev/null
 }
 
+fm_lock_expected_command_valid() {
+  case "$1" in ''|*[!A-Za-z0-9._+-]*) return 1 ;; esac
+}
+
 fm_lock_prepare_owner() {
-  local ownerdir=$1 mypid back
+  local ownerdir=$1 expected=${2:-} mypid back identity
   mypid=${BASHPID:-$$}
   printf '%s\n' "$mypid" > "$ownerdir/pid" 2>/dev/null || return 1
   back=$(cat "$ownerdir/pid" 2>/dev/null || true)
-  [ "$back" = "$mypid" ]
+  [ "$back" = "$mypid" ] || return 1
+  [ -n "$expected" ] || return 0
+  fm_lock_expected_command_valid "$expected" || return 1
+  declare -F fm_process_command_identity >/dev/null 2>&1 || return 1
+  identity=$(fm_process_command_identity "$mypid" "$expected") || return 1
+  [[ "$identity" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$expected" > "$ownerdir/expected-command" 2>/dev/null || return 1
+  printf '%s\n' "$identity" > "$ownerdir/pid-identity" 2>/dev/null || return 1
+  chmod 0600 "$ownerdir/pid" "$ownerdir/expected-command" \
+    "$ownerdir/pid-identity" 2>/dev/null
 }
 
 fm_lock_link_owner() {
@@ -412,15 +432,15 @@ fm_lock_claim() {
   return 0
 }
 
-fm_lock_try_create() {
-  local lockdir=$1 allowed_steal_owner=${2:-} ownerdir
+_fm_lock_try_create() {
+  local lockdir=$1 allowed_steal_owner=${2:-} expected=${3:-} ownerdir
   FM_LOCK_OWNER_DIR=
   ownerdir=$(fm_lock_owner_dir "$lockdir") || return 1
   if [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
     fm_lock_discard_owner "$ownerdir"
     return 1
   fi
-  if ! fm_lock_prepare_owner "$ownerdir"; then
+  if ! fm_lock_prepare_owner "$ownerdir" "$expected"; then
     fm_lock_discard_owner "$ownerdir"
     return 1
   fi
@@ -437,6 +457,129 @@ fm_lock_try_create() {
   fi
   fm_lock_discard_owner "$ownerdir"
   return 1
+}
+
+fm_lock_path_is_metadata() {
+  local base=${1##*/} id
+  case "$base" in
+    .meta-*.lock)
+      id=${base#.meta-}
+      id=${id%.lock}
+      ;;
+    *) return 1 ;;
+  esac
+  case "$id" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+}
+
+fm_lock_path_is_control() {
+  local base=${1##*/} id
+  case "$base" in
+    .control-*.lock)
+      id=${base#.control-}
+      id=${id%.lock}
+      ;;
+    *) return 1 ;;
+  esac
+  case "$id" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+}
+
+fm_lock_path_is_reserved() {
+  fm_lock_path_is_metadata "$1" || fm_lock_path_is_control "$1"
+}
+
+fm_lock_try_create() {
+  fm_lock_path_is_reserved "$1" && return 2
+  _fm_lock_try_create "$@"
+}
+
+fm_lock_typed_owner_proven_stale() {
+  local lockdir=$1 pid=$2 expected recorded observed args lines
+  fm_pid_alive "$pid" || return 0
+  if [ ! -e "$lockdir/expected-command" ] \
+    && [ ! -e "$lockdir/pid-identity" ]; then
+    return 1
+  fi
+  [ -f "$lockdir/expected-command" ] && [ ! -L "$lockdir/expected-command" ] \
+    && [ -f "$lockdir/pid-identity" ] && [ ! -L "$lockdir/pid-identity" ] \
+    || return 1
+  lines=$(wc -l < "$lockdir/expected-command" 2>/dev/null | tr -d '[:space:]') \
+    || return 1
+  [ "$lines" = 1 ] || return 1
+  lines=$(wc -l < "$lockdir/pid-identity" 2>/dev/null | tr -d '[:space:]') \
+    || return 1
+  [ "$lines" = 1 ] || return 1
+  expected=$(cat "$lockdir/expected-command" 2>/dev/null) || return 1
+  recorded=$(cat "$lockdir/pid-identity" 2>/dev/null) || return 1
+  fm_lock_expected_command_valid "$expected" || return 1
+  [[ "$recorded" =~ ^[0-9a-f]{64}$ ]] || return 1
+  if declare -F fm_process_command_identity >/dev/null 2>&1; then
+    observed=$(fm_process_command_identity "$pid" "$expected" 2>/dev/null || true)
+    if [ -n "$observed" ]; then
+      [ "$observed" != "$recorded" ]
+      return
+    fi
+  fi
+  args=$(ps -ww -o args= -p "$pid" 2>/dev/null || true)
+  if ! fm_pid_alive "$pid"; then
+    return 0
+  fi
+  [ -n "$args" ] || return 1
+  case "$args" in *"$expected"*) return 1 ;; esac
+  return 0
+}
+
+fm_control_legacy_owner_proven_stale() {
+  local lockdir=$1 pid=$2 args
+  fm_pid_alive "$pid" || return 0
+  if [ -e "$lockdir/expected-command" ] || [ -L "$lockdir/expected-command" ] \
+    || [ -e "$lockdir/pid-identity" ] || [ -L "$lockdir/pid-identity" ]; then
+    return 1
+  fi
+  args=$(ps -ww -o args= -p "$pid" 2>/dev/null || true)
+  if ! fm_pid_alive "$pid"; then
+    return 0
+  fi
+  [ -n "$args" ] || return 1
+  case "$args" in
+    *fm-control.sh*|*fm-spawn.sh*|*fm-teardown.sh*|*fm-promote.sh*|*fm-secondmate-reconcile.sh*)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+fm_lock_owner_proven_stale() {
+  local lockdir=$1 pid=$2 stale_policy=${3:-}
+  fm_lock_typed_owner_proven_stale "$lockdir" "$pid" && return 0
+  case "$stale_policy" in
+    control) fm_control_legacy_owner_proven_stale "$lockdir" "$pid" ;;
+    *) return 1 ;;
+  esac
+}
+
+fm_lock_typed_owner_matches() {
+  local lockdir=$1 pid=$2 expected=$3 recorded observed lines
+  fm_pid_alive "$pid" || return 1
+  fm_lock_expected_command_valid "$expected" || return 1
+  [ -f "$lockdir/expected-command" ] && [ ! -L "$lockdir/expected-command" ] \
+    && [ -f "$lockdir/pid-identity" ] && [ ! -L "$lockdir/pid-identity" ] \
+    || return 1
+  lines=$(wc -l < "$lockdir/expected-command" 2>/dev/null | tr -d '[:space:]') \
+    || return 1
+  [ "$lines" = 1 ] || return 1
+  lines=$(wc -l < "$lockdir/pid-identity" 2>/dev/null | tr -d '[:space:]') \
+    || return 1
+  [ "$lines" = 1 ] || return 1
+  [ "$(cat "$lockdir/expected-command" 2>/dev/null)" = "$expected" ] || return 1
+  recorded=$(cat "$lockdir/pid-identity" 2>/dev/null) || return 1
+  [[ "$recorded" =~ ^[0-9a-f]{64}$ ]] || return 1
+  declare -F fm_process_command_identity >/dev/null 2>&1 || return 1
+  observed=$(fm_process_command_identity "$pid" "$expected") || return 1
+  [ "$observed" = "$recorded" ]
 }
 
 fm_lock_remove_path() {
@@ -465,7 +608,7 @@ fm_lock_mid_acquire_is_fresh() {
 }
 
 fm_lock_recheck_stale_owner() {
-  local lockdir=$1 expected_owner=$2 expected_pid=$3 actual_pid
+  local lockdir=$1 expected_owner=$2 expected_pid=$3 stale_policy=${4:-} actual_pid
   if [ -n "$expected_owner" ]; then
     fm_lock_points_to_owner "$lockdir" "$expected_owner" || return 1
   elif [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
@@ -473,7 +616,8 @@ fm_lock_recheck_stale_owner() {
   fi
   actual_pid=$(cat "$lockdir/pid" 2>/dev/null || true)
   [ "$actual_pid" = "$expected_pid" ] || return 1
-  if fm_pid_alive "$actual_pid"; then
+  if fm_pid_alive "$actual_pid" \
+    && ! fm_lock_owner_proven_stale "$lockdir" "$actual_pid" "$stale_policy"; then
     return 1
   fi
   if fm_lock_mid_acquire_is_fresh "$lockdir" "$actual_pid"; then
@@ -791,14 +935,20 @@ fm_recovery_marker_reopen_announced() {
   fm_recovery_transition "$1" reopen-announced
 }
 
-fm_lock_try_acquire() {
-  local lockdir=$1 pid steal cur rc steal_owner primary_owner
+_fm_lock_try_acquire() {
+  local lockdir=$1 expected=${2:-} stale_policy=${3:-}
+  local pid steal cur rc steal_owner primary_owner
   FM_LOCK_HELD_PID=
   FM_LOCK_OWNER_DIR=
   FM_LOCK_RECOVERED_PID=
+  [ -z "$expected" ] || fm_lock_expected_command_valid "$expected" || return 1
+  case "$stale_policy" in ''|control) ;; *) return 1 ;; esac
 
-  if fm_lock_try_create "$lockdir"; then
+  if _fm_lock_try_create "$lockdir" "" "$expected"; then
     return 0
+  fi
+  if [ ! -e "$lockdir" ] && [ ! -L "$lockdir" ]; then
+    return 1
   fi
 
   # Compare against ${BASHPID:-$$} inline, never via a command substitution:
@@ -814,13 +964,14 @@ fm_lock_try_acquire() {
     # - the hang reproduced by the self-held reclaim regression in
     # tests/fm-wake-queue.test.sh - so reclaim the abandoned hold instead.
     fm_lock_remove_path "$lockdir" || true
-    if fm_lock_try_create "$lockdir"; then
+    if _fm_lock_try_create "$lockdir" "" "$expected"; then
       return 0
     fi
     FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
     return 1
   fi
-  if fm_pid_alive "$pid"; then
+  if fm_pid_alive "$pid" \
+    && ! fm_lock_owner_proven_stale "$lockdir" "$pid" "$stale_policy"; then
     FM_LOCK_HELD_PID=$pid
     return 1
   fi
@@ -830,7 +981,7 @@ fm_lock_try_acquire() {
   fi
 
   steal="$lockdir.steal"
-  if ! fm_lock_try_acquire "$steal"; then
+  if ! _fm_lock_try_acquire "$steal" "$expected" "$stale_policy"; then
     FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
     FM_LOCK_OWNER_DIR=
     return 1
@@ -838,7 +989,8 @@ fm_lock_try_acquire() {
   steal_owner=${FM_LOCK_OWNER_DIR:-}
 
   cur=$(cat "$lockdir/pid" 2>/dev/null || true)
-  if fm_pid_alive "$cur"; then
+  if fm_pid_alive "$cur" \
+    && ! fm_lock_owner_proven_stale "$lockdir" "$cur" "$stale_policy"; then
     fm_lock_release "$steal"
     FM_LOCK_HELD_PID=$cur
     FM_LOCK_OWNER_DIR=
@@ -862,7 +1014,7 @@ fm_lock_try_acquire() {
     primary_owner=$(fm_lock_link_owner "$lockdir" 2>/dev/null || true)
   fi
   cur=$(cat "$lockdir/pid" 2>/dev/null || true)
-  if ! fm_lock_recheck_stale_owner "$lockdir" "$primary_owner" "$cur"; then
+  if ! fm_lock_recheck_stale_owner "$lockdir" "$primary_owner" "$cur" "$stale_policy"; then
     fm_lock_release "$steal"
     FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
     FM_LOCK_OWNER_DIR=
@@ -878,7 +1030,7 @@ fm_lock_try_acquire() {
   fi
   fm_lock_remove_path "$lockdir" || true
   rc=1
-  if fm_lock_try_create "$lockdir" "$steal_owner"; then
+  if _fm_lock_try_create "$lockdir" "$steal_owner" "$expected"; then
     rc=0
     # shellcheck disable=SC2034 # Read by sourcing callers after lock acquisition.
     FM_LOCK_RECOVERED_PID=$cur
@@ -892,9 +1044,15 @@ fm_lock_try_acquire() {
   return "$rc"
 }
 
+fm_lock_try_acquire() {
+  fm_lock_path_is_reserved "$1" && return 2
+  _fm_lock_try_acquire "$@"
+}
+
 fm_lock_acquire_wait() {
-  local lockdir=$1
-  while ! fm_lock_try_acquire "$lockdir"; do
+  local lockdir=$1 expected=${2:-}
+  fm_lock_path_is_reserved "$lockdir" && return 2
+  while ! fm_lock_try_acquire "$lockdir" "$expected"; do
     sleep 0.1
   done
 }
@@ -931,6 +1089,109 @@ fm_meta_lock_path() {
     ''|*[!A-Za-z0-9._-]*) return 1 ;;
   esac
   printf '%s/.meta-%s.lock\n' "$dir" "$id"
+}
+
+fm_meta_lock_acquire_bounded() {
+  local meta=$1 expected=$2 attempts=${3:-${FM_META_LOCK_ATTEMPTS:-50}}
+  local interval=${4:-${FM_META_LOCK_INTERVAL:-0.1}} lock attempt=1 id held
+  id=${meta##*/}
+  id=${id%.meta}
+  if ! fm_lock_expected_command_valid "$expected"; then
+    printf 'error: invalid typed metadata lock request for task %s\n' "$id" >&2
+    return 2
+  fi
+  case "$attempts" in
+    ''|*[!0-9]*|0)
+      printf 'error: invalid typed metadata lock request for task %s\n' "$id" >&2
+      return 2
+      ;;
+  esac
+  if [ "$attempts" -gt 600 ] \
+    || ! [[ "$interval" =~ ^(0([.][0-9]+)?|1([.]0+)?)$ ]] \
+    || ! lock=$(fm_meta_lock_path "$meta"); then
+    printf 'error: invalid typed metadata lock request for task %s\n' "$id" >&2
+    return 2
+  fi
+  if ! declare -F fm_process_command_identity >/dev/null 2>&1; then
+    # shellcheck source=bin/fm-session-lock-lib.sh
+    . "$FM_WAKE_LIB_DIR/fm-session-lock-lib.sh"
+  fi
+  if ! declare -F fm_process_command_identity >/dev/null 2>&1; then
+    printf 'error: process identity is unavailable for task %s metadata ownership\n' "$id" >&2
+    return 2
+  fi
+  while [ "$attempt" -le "$attempts" ]; do
+    if _fm_lock_try_acquire "$lock" "$expected"; then
+      return 0
+    fi
+    [ "$attempt" -ge "$attempts" ] || [ "$interval" = 0 ] || sleep "$interval"
+    attempt=$((attempt + 1))
+  done
+  held=${FM_LOCK_HELD_PID:-unknown}
+  printf 'error: task %s metadata remained owned by process %s after %s bounded attempt(s)\n' \
+    "$id" "$held" "$attempts" >&2
+  return 1
+}
+
+fm_control_lock_path() {
+  local state=$1 id=$2
+  [ -n "$state" ] || return 1
+  case "$state" in *[$'\n\r\t']*) return 1 ;; esac
+  case "$id" in
+    ''|.*|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  printf '%s/.control-%s.lock\n' "$state" "$id"
+}
+
+fm_control_lock_acquire_bounded() {
+  local state=$1 id=$2 expected=$3 attempts=${4:-${FM_CONTROL_LOCK_ATTEMPTS:-50}}
+  local interval=${5:-${FM_CONTROL_LOCK_INTERVAL:-0.1}} lock attempt=1 held
+  if ! fm_lock_expected_command_valid "$expected"; then
+    printf 'error: invalid typed control lock request for task %s\n' "$id" >&2
+    return 2
+  fi
+  case "$attempts" in
+    ''|*[!0-9]*|0)
+      printf 'error: invalid typed control lock request for task %s\n' "$id" >&2
+      return 2
+      ;;
+  esac
+  if [ "$attempts" -gt 600 ] \
+    || ! [[ "$interval" =~ ^(0([.][0-9]+)?|1([.]0+)?)$ ]] \
+    || ! lock=$(fm_control_lock_path "$state" "$id"); then
+    printf 'error: invalid typed control lock request for task %s\n' "$id" >&2
+    return 2
+  fi
+  if ! declare -F fm_process_command_identity >/dev/null 2>&1; then
+    # shellcheck source=bin/fm-session-lock-lib.sh
+    . "$FM_WAKE_LIB_DIR/fm-session-lock-lib.sh"
+  fi
+  if ! declare -F fm_process_command_identity >/dev/null 2>&1; then
+    printf 'error: process identity is unavailable for task %s control ownership\n' "$id" >&2
+    return 2
+  fi
+  while [ "$attempt" -le "$attempts" ]; do
+    if _fm_lock_try_acquire "$lock" "$expected" control; then
+      return 0
+    fi
+    [ "$attempt" -ge "$attempts" ] || [ "$interval" = 0 ] || sleep "$interval"
+    attempt=$((attempt + 1))
+  done
+  held=${FM_LOCK_HELD_PID:-unknown}
+  printf 'error: task %s control remained owned by process %s after %s bounded attempt(s)\n' \
+    "$id" "$held" "$attempts" >&2
+  return 1
+}
+
+fm_control_lock_owned_by_process() {
+  local state=$1 id=$2 pid=$3 expected=$4 lock
+  lock=$(fm_control_lock_path "$state" "$id") || return 1
+  if ! declare -F fm_process_command_identity >/dev/null 2>&1; then
+    # shellcheck source=bin/fm-session-lock-lib.sh
+    . "$FM_WAKE_LIB_DIR/fm-session-lock-lib.sh"
+  fi
+  declare -F fm_process_command_identity >/dev/null 2>&1 || return 1
+  fm_lock_typed_owner_matches "$lock" "$pid" "$expected"
 }
 
 # fm_task_set_lock_path: the per-home lock guarding WHICH tasks exist in a home,

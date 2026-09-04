@@ -112,7 +112,8 @@
 # refusal above has already passed, and BEFORE any worktree return, branch
 # delete, or backend kill below - a still-active run or a leaked process may
 # own live work in that worktree):
-#   Fix 1 - conclude the task's own no-mistakes run. A ship task's worktree can
+#   Fix 1 - when inactive migration compatibility is explicitly enabled, conclude
+#     the task's own already-running legacy no-mistakes run. A ship task's worktree can
 #     be torn down while its no-mistakes pipeline run is still PARKED at a gate
 #     (awaiting_approval/fix_review/any awaiting_agent field), with no worker
 #     left to ever answer it - the run then sits there holding a fleet slot
@@ -215,7 +216,7 @@ if [ "$FORCE" = --force ] && [ "$(fm_lease_actor)" = branch ]; then
   exit "$FM_LEASE_REFUSE_EXIT"
 fi
 fm_lease_guard "$ID" "teardown (fm-teardown)"
-CONTROL_LOCK="$STATE/.control-$ID.lock"
+CONTROL_LOCK=$(fm_control_lock_path "$STATE" "$ID") || exit 1
 CONTROL_LOCK_HELD=0
 META_LOCK=
 META_LOCK_HELD=0
@@ -257,12 +258,12 @@ teardown_release_locks() {
   return "$status"
 }
 trap teardown_release_locks EXIT
-fm_lock_try_acquire "$CONTROL_LOCK" || {
+fm_control_lock_acquire_bounded "$STATE" "$ID" fm-teardown.sh 1 0 || {
   echo "error: another lifecycle action is already running for task $ID; nothing was changed" >&2
   exit 1
 }
 CONTROL_LOCK_HELD=1
-# Fail closed before any fleet mutation: a no-mistakes gate agent must never tear
+# Fail closed before any fleet mutation: an inactive legacy no-mistakes gate agent must never tear
 # down a worktree (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
 FM_LOCK_LOG_PREFIX=teardown
@@ -273,7 +274,7 @@ fm_backlog_record_present "$META" "task record" "$STATE" || {
   exit 1
 }
 META_LOCK=$(fm_meta_lock_path "$META") || exit 1
-fm_lock_acquire_wait "$META_LOCK"
+fm_meta_lock_acquire_bounded "$META" fm-teardown.sh || exit 1
 META_LOCK_HELD=1
 fm_backlog_record_present "$META" "task record" "$STATE" || {
   echo "error: teardown refused after locking: $FM_BACKLOG_TRANSITION_ERROR" >&2
@@ -725,6 +726,10 @@ BACKEND=$FM_BACKEND_VALIDATED_BACKEND
 T=$FM_BACKEND_VALIDATED_TARGET
 WT=$(fm_meta_get "$META" worktree)
 PROJ=$(fm_meta_get "$META" project)
+if [ "$BACKEND" = codex-app-host ]; then
+  echo "REFUSED: task $ID is owned by the Codex Desktop host; archive exact task $T with the Desktop host tool first. Firstmate preserves its metadata, status, and worktree because host-task retirement is not implemented." >&2
+  exit 1
+fi
 T_ORCA=
 [ "$BACKEND" != orca ] || T_ORCA=$T
 if [ "${FM_TEARDOWN_GUARD_DONE:-0}" != 1 ]; then
@@ -745,7 +750,7 @@ CLEANUP_RECOVERY=$TEARDOWN_CLEANUP_RECOVERY
 
 KIND=$TEARDOWN_META_KIND
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
-[ -n "$MODE" ] || MODE=no-mistakes
+[ -n "$MODE" ] || MODE=direct-PR
 PUBLIC_FOLLOWUP_HOME=$FM_HOME
 PUBLIC_FOLLOWUP_STATE=$STATE
 PUBLIC_FOLLOWUP_WORK_HOME=main
@@ -1477,7 +1482,7 @@ validate_worktree_teardown_safety() {
   fi
 }
 
-# Fix 1 (see script header): does the active-or-most-recent no-mistakes run in
+# Fix 1 (see script header): under explicit inactive migration compatibility, does the active-or-most-recent no-mistakes run in
 # worktree $1 belong to THIS task, and is it parked at a gate awaiting an agent
 # that is about to be removed? Prints nothing; returns 0 only on a genuine
 # match so the caller knows it is safe to abort - never a guess.
@@ -1537,13 +1542,14 @@ task_status_is_run_not_found() {  # <status-error> <run-id>
   [ "$actual" = "$expected" ]
 }
 
-# Abort THIS task's own parked no-mistakes run before the worker that would
+# Under explicit inactive migration compatibility, abort THIS task's own parked no-mistakes run before the worker that would
 # have answered its gate is removed, so no run is left orphaned holding a
-# fleet slot. Only KIND=ship drives a no-mistakes validation of its own
+# fleet slot. In that compatibility path, only KIND=ship drives a no-mistakes validation of its own
 # worktree (scouts and secondmates never do, mirroring bin/fm-crew-state.sh);
 # a run not attributed to this exact branch+head is left completely alone.
 conclude_task_no_mistakes_run() {  # <worktree>
   local wt=$1 out run_id
+  [ "${FM_INACTIVE_NO_MISTAKES_COMPAT:-0}" = 1 ] || return 0
   [ "$KIND" = ship ] || return 0
   [ -d "$wt" ] || return 0
   command -v no-mistakes >/dev/null 2>&1 || return 0
@@ -2246,17 +2252,20 @@ preflight_descendant_task_locks() {
     state=${DESCENDANT_TASK_STATES[$i]}
     task_id=${DESCENDANT_TASK_IDS[$i]}
     meta="$state/$task_id.meta"
-    control_lock="$state/.control-$task_id.lock"
+    control_lock=$(fm_control_lock_path "$state" "$task_id") || {
+      echo "REFUSED: descendant task $task_id has an invalid control lock path; forced teardown changed nothing" >&2
+      return 1
+    }
     meta_lock=$(fm_meta_lock_path "$meta") || {
       echo "REFUSED: descendant task $task_id has an invalid metadata lock path; forced teardown changed nothing" >&2
       return 1
     }
-    if ! fm_lock_try_acquire "$control_lock"; then
+    if ! fm_control_lock_acquire_bounded "$state" "$task_id" fm-teardown.sh 1 0; then
       echo "REFUSED: descendant task $task_id has a lifecycle action in flight (control lock is held); forced teardown changed nothing" >&2
       return 1
     fi
     DESCENDANT_LOCK_PATHS+=("$control_lock")
-    if ! fm_lock_try_acquire "$meta_lock"; then
+    if ! fm_meta_lock_acquire_bounded "$meta" fm-teardown.sh 1 0; then
       echo "REFUSED: descendant task $task_id has a metadata update in flight (metadata lock is held); forced teardown changed nothing" >&2
       return 1
     fi

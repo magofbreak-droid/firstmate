@@ -7,7 +7,7 @@
 # Check runs and commit statuses are read directly for the expected SHA, while
 # the PR head, base, and combined requirement set are confirmed around each snapshot.
 # Missing, pending, skipped, failed, ambiguous, stale, or different-head
-# results are never green, regardless of a CLI's exit status.
+# required results are never green, regardless of a CLI's exit status.
 # Usage: fm-pr-ci.sh <full-pr-url> <exact-head-sha> [--attempts <1-60>] [--interval <0-60>]
 set -u
 
@@ -225,6 +225,8 @@ validate_exact_head_evidence() {
       conclusion = $6
       app_id = $7
       app_slug = $8
+      raw_result_total++
+      if (!(name in required_seen)) next
       if (kind != "check" && kind != "status") reject("unknown exact-head result type")
       if (sha != expected) reject("different-head check evidence for " name)
       if (name == "") reject("unnamed exact-head check evidence")
@@ -254,7 +256,7 @@ validate_exact_head_evidence() {
       if (required_total == 0) reject("no effective required checks were found for the PR base branch")
       if (canonical_required == 0) reject("canonical Verify exact PR head requirement is missing")
       if (canonical_required > 1) reject("canonical Verify exact PR head requirement is ambiguous")
-      if (result_total == 0) reject("no exact-head checks or statuses were found")
+      if (raw_result_total == 0) reject("no exact-head checks or statuses were found")
       for (name in required_seen) {
         if (!(name in result_seen)) {
           if (name == "Verify exact PR head") {

@@ -138,10 +138,10 @@ test_exact_head_green_contract() {
   make_pr_fixture "$dir" "$sha" '' ''
   printf 'require\trequired\tnone\tVerify exact PR head\tnone\tnone\t15368\tnone\n' > "$dir/requirements"
   printf 'result\tcheck\t%s\tVerify exact PR head\tcompleted\tsuccess\t15368\tgithub-actions\n' "$sha" > "$dir/check-runs"
-  printf 'result\tstatus\t%s\tpolicy\tcompleted\tsuccess\tnone\tnone\n' "$sha" > "$dir/statuses"
+  : > "$dir/statuses"
   out=$(run_pr_ci "$dir" "$sha") \
     || fail "exact-head wait rejected terminal success: $out"
-  assert_contains "$out" "green: https://github.com/example/repo/pull/7 head=$sha checks=2" \
+  assert_contains "$out" "green: https://github.com/example/repo/pull/7 head=$sha checks=1" \
     "exact-head wait did not report the verified identity"
   assert_grep "repos/example/repo/commits/$sha/check-runs?filter=latest&per_page=100" "$dir/gh.log" \
     "exact-head wait did not query check runs by commit SHA"
@@ -151,6 +151,14 @@ test_exact_head_green_contract() {
     "exact-head wait did not query base-branch protection"
   assert_grep 'repos/example/repo/rules/branches/main' "$dir/gh.log" \
     "exact-head wait did not query effective base-branch rules"
+
+  printf 'result\tcheck\t%s\tVerify exact PR head\tcompleted\tsuccess\t15368\tgithub-actions\nresult\tcheck\t%s\tVerify complete main repository\tcompleted\tskipped\t15368\tgithub-actions\n' \
+    "$sha" "$sha" > "$dir/check-runs"
+  : > "$dir/statuses"
+  out=$(run_pr_ci "$dir" "$sha") \
+    || fail "an optional skipped workflow job blocked required-check success: $out"
+  assert_contains "$out" "green: https://github.com/example/repo/pull/7 head=$sha checks=1" \
+    "exact-head wait counted or rejected a non-required skipped workflow job"
 
   printf '%s\n' \
     $'require\trequired\tnone\tVerify exact PR head\tnone\tnone\t15368\tnone' \

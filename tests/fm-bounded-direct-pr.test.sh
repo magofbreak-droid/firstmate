@@ -87,6 +87,7 @@ case " $* " in
   *"/branches/"*"/protection"*)
     if [ "${FM_TEST_CLASSIC_PLAN_UNAVAILABLE:-0}" = 1 ]; then
       printf 'gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)\n' >&2
+      printf '{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature.","status":"403"}'
       exit 1
     fi
     if [ "${FM_TEST_CLASSIC_UNPROTECTED:-0}" = 1 ]; then
@@ -95,6 +96,7 @@ case " $* " in
     fi
     if [ "${FM_TEST_CLASSIC_FORBIDDEN:-0}" = 1 ]; then
       printf 'gh: Resource not accessible by integration (HTTP 403)\n' >&2
+      printf '{"message":"Resource not accessible by integration","status":"403"}'
       exit 1
     fi
     if [ -n "${FM_TEST_CLASSIC_PAYLOAD:-}" ]; then
@@ -114,10 +116,12 @@ case " $* " in
     ;;
   *"/rules/branches/"*)
     if [ "${FM_TEST_RULES_PLAN_UNAVAILABLE:-0}" = 1 ]; then
+      printf '{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature.","status":"403"}'
       printf 'gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)\n' >&2
       exit 1
     fi
     if [ "${FM_TEST_RULES_FORBIDDEN:-0}" = 1 ]; then
+      printf '{"message":"Resource not accessible by integration","status":"403"}'
       printf 'gh: Resource not accessible by integration (HTTP 403)\n' >&2
       exit 1
     fi

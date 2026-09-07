@@ -8,15 +8,20 @@
 # the PR head, base, and combined requirement set are confirmed around each snapshot.
 # Missing, pending, skipped, failed, ambiguous, stale, or different-head
 # required results are never green, regardless of a CLI's exit status.
-# Usage: fm-pr-ci.sh <full-pr-url> <exact-head-sha> [--attempts <1-60>] [--interval <0-60>]
+# A private policy from docs/configuration.md may replace unavailable server
+# requirements only when both GitHub rule APIs return the exact plan-feature
+# refusal. Every other unavailable or mixed requirement source is refused.
+# Usage: fm-pr-ci.sh <full-pr-url> <exact-head-sha> [--attempts <1-60>] [--interval <0-60>] [--required-check-policy <absolute-json>]
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+# shellcheck source=bin/fm-pr-ci-policy-lib.sh
+. "$SCRIPT_DIR/fm-pr-ci-policy-lib.sh"
 
 usage() {
-  echo "usage: fm-pr-ci.sh <full-pr-url> <exact-head-sha> [--attempts <1-60>] [--interval <0-60>]" >&2
+  echo "usage: fm-pr-ci.sh <full-pr-url> <exact-head-sha> [--attempts <1-60>] [--interval <0-60>] [--required-check-policy <absolute-json>]" >&2
   exit 2
 }
 
@@ -26,10 +31,16 @@ EXPECTED_HEAD=$2
 shift 2
 ATTEMPTS=30
 INTERVAL=10
+REQUIRED_CHECK_POLICY=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --attempts) [ "$#" -ge 2 ] || usage; ATTEMPTS=$2; shift 2 ;;
     --interval) [ "$#" -ge 2 ] || usage; INTERVAL=$2; shift 2 ;;
+    --required-check-policy)
+      [ "$#" -ge 2 ] && [ -z "$REQUIRED_CHECK_POLICY" ] || usage
+      REQUIRED_CHECK_POLICY=$2
+      shift 2
+      ;;
     *) usage ;;
   esac
 done
@@ -47,6 +58,28 @@ command -v gh >/dev/null 2>&1 || {
   echo "error: exact-head verification requires gh on PATH" >&2
   exit 1
 }
+if [ -n "$REQUIRED_CHECK_POLICY" ]; then
+  case "$REQUIRED_CHECK_POLICY" in /*) ;; *) usage ;; esac
+  POLICY_REAL=$(realpath "$REQUIRED_CHECK_POLICY" 2>/dev/null) || {
+    echo "error: private required-check policy is unavailable or unsafe" >&2
+    exit 1
+  }
+  if [ "$POLICY_REAL" != "$REQUIRED_CHECK_POLICY" ] \
+    || ! fm_pr_ci_policy_parse "$REQUIRED_CHECK_POLICY" "$OWNER/$REPO" ''; then
+    echo "error: private required-check policy is unavailable, unsafe, or invalid" >&2
+    exit 1
+  fi
+  REQUIRED_CHECK_POLICY_HASH=$FM_PR_CI_POLICY_HASH
+  if [ -n "${FM_PR_CI_POLICY_SHA256:-}" ] \
+    && [ "$FM_PR_CI_POLICY_SHA256" != "$REQUIRED_CHECK_POLICY_HASH" ]; then
+    echo "error: private required-check policy does not match its recorded identity" >&2
+    exit 1
+  fi
+else
+  REQUIRED_CHECK_POLICY_HASH=
+fi
+
+PLAN_FEATURE_UNAVAILABLE='gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)'
 
 read_head() {
   gh pr view "$URL" --json headRefOid -q .headRefOid 2>/dev/null
@@ -94,14 +127,16 @@ read_classic_required_checks() {
     printf '%s\n' "$response"
     return 0
   fi
-  [ "$response" = 'gh: Branch not protected (HTTP 404)' ]
+  [ "$response" = 'gh: Branch not protected (HTTP 404)' ] && return 0
+  [ "$response" = "$PLAN_FEATURE_UNAVAILABLE" ] && return 20
+  return 1
 }
 
 read_ruleset_required_checks() {
-  local base_path
+  local base_path response status=0
   base_path=$(fm_pr_urlencode_path_segment "$1") || return 1
   # shellcheck disable=SC2016
-  gh api --paginate -H 'Accept: application/vnd.github+json' \
+  response=$(gh api --paginate -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' \
     "repos/$OWNER/$REPO/rules/branches/$base_path?per_page=100" \
     --jq '
@@ -129,7 +164,13 @@ read_ruleset_required_checks() {
           @tsv
         end
       end
-    ' 2>/dev/null
+    ' 2>&1) || status=$?
+  if [ "$status" -eq 0 ]; then
+    printf '%s\n' "$response"
+    return 0
+  fi
+  [ "$response" = "$PLAN_FEATURE_UNAVAILABLE" ] && return 20
+  return 1
 }
 
 combine_required_checks() {
@@ -168,9 +209,18 @@ combine_required_checks() {
 }
 
 read_required_checks() {
-  local classic rules
-  classic=$(read_classic_required_checks "$1") || return 1
-  rules=$(read_ruleset_required_checks "$1") || return 1
+  local classic rules classic_status=0 rules_status=0
+  classic=$(read_classic_required_checks "$1") || classic_status=$?
+  rules=$(read_ruleset_required_checks "$1") || rules_status=$?
+  if [ "$classic_status" -eq 20 ] && [ "$rules_status" -eq 20 ]; then
+    [ -n "$REQUIRED_CHECK_POLICY" ] \
+      && fm_pr_ci_policy_parse "$REQUIRED_CHECK_POLICY" "$OWNER/$REPO" "$1" \
+      && [ "$FM_PR_CI_POLICY_HASH" = "$REQUIRED_CHECK_POLICY_HASH" ] || return 1
+    printf '%s\n' "$FM_PR_CI_POLICY_REQUIREMENTS" | LC_ALL=C sort
+    return 0
+  fi
+  [ "$classic_status" -eq 0 ] && [ "$rules_status" -eq 0 ] || return 1
+  [ -z "$REQUIRED_CHECK_POLICY" ] || return 1
   printf '%s\n%s\n' "$classic" "$rules" | combine_required_checks | LC_ALL=C sort
 }
 
@@ -199,20 +249,31 @@ validate_exact_head_evidence() {
       next
     }
     $1 == "require" {
-      if ($2 != "required" || $3 != "none" || $4 == "" ||
-          $5 != "none" || $6 != "none" || $8 != "none") {
+      if ($2 != "required" || ($3 != "none" && $3 != "policy") || $4 == "" ||
+          $5 != "none" || $6 != "none") {
         reject("malformed required-check evidence")
         next
       }
       name = $4
       provider = $7
+      provider_slug = $8
       if (provider != "any" && provider !~ /^[1-9][0-9]*$/) {
         reject("malformed required-check provider for " name)
       }
+      if ($3 == "none" && provider_slug != "none") {
+        reject("malformed server required-check provider for " name)
+      }
+      if ($3 == "policy" &&
+          (provider == "any" || provider_slug !~ /^[A-Za-z0-9][A-Za-z0-9-]*$/)) {
+        reject("malformed policy required-check provider for " name)
+      }
+      if (requirement_source == "") requirement_source = $3
+      else if (requirement_source != $3) reject("mixed required-check sources")
       if (++required_seen[name] > 1) {
         reject("ambiguous required-check evidence for " name)
       }
       required_provider[name] = provider
+      required_provider_slug[name] = provider_slug
       required_total++
       if (name == "Verify exact PR head") canonical_required++
       next
@@ -254,8 +315,8 @@ validate_exact_head_evidence() {
     { reject("unknown exact-head evidence record") }
     END {
       if (required_total == 0) reject("no effective required checks were found for the PR base branch")
-      if (canonical_required == 0) reject("canonical Verify exact PR head requirement is missing")
-      if (canonical_required > 1) reject("canonical Verify exact PR head requirement is ambiguous")
+      if (requirement_source == "none" && canonical_required == 0) reject("canonical Verify exact PR head requirement is missing")
+      if (requirement_source == "none" && canonical_required > 1) reject("canonical Verify exact PR head requirement is ambiguous")
       if (raw_result_total == 0) reject("no exact-head checks or statuses were found")
       for (name in required_seen) {
         if (!(name in result_seen)) {
@@ -271,9 +332,13 @@ validate_exact_head_evidence() {
             (result_kind[name] != "check" || result_app_id[name] != provider)) {
           reject("required check provider mismatch: " name)
         }
+        provider_slug = required_provider_slug[name]
+        if (provider_slug != "none" && result_app_slug[name] != provider_slug) {
+          reject("required check provider mismatch: " name)
+        }
       }
       canonical = "Verify exact PR head"
-      if (canonical in result_seen) {
+      if (requirement_source == "none" && canonical in result_seen) {
         if (result_kind[canonical] != "check" ||
             result_app_id[canonical] !~ /^[1-9][0-9]*$/ ||
             result_app_slug[canonical] != "github-actions") {

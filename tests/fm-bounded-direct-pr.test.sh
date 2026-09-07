@@ -6,8 +6,10 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-bounded-direct-pr)
+TMP_ROOT=$(realpath "$TMP_ROOT")
 VERIFY="$ROOT/bin/fm-verify.sh"
 PR_CI="$ROOT/bin/fm-pr-ci.sh"
+PR_CHECK="$ROOT/bin/fm-pr-check.sh"
 
 make_verify_fixture() {
   local dir=$1
@@ -66,7 +68,12 @@ test_canonical_verify_contract() {
 
 make_pr_fixture() {
   local dir=$1 head=$2 check_runs=$3 statuses=${4:-}
-  mkdir -p "$dir/fakebin"
+  mkdir -p "$dir/fakebin" "$dir/home/state" "$dir/wt" "$dir/root/bin"
+  cat > "$dir/root/bin/fm-guard.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$dir/root/bin/fm-guard.sh"
   printf '%s\n' "$head" > "$dir/head"
   printf '%s\n' "$check_runs" > "$dir/check-runs"
   printf '%s\n' "$statuses" > "$dir/statuses"
@@ -78,6 +85,10 @@ make_pr_fixture() {
 printf '%s\n' "$*" >> "$FM_TEST_GH_LOG"
 case " $* " in
   *"/branches/"*"/protection"*)
+    if [ "${FM_TEST_CLASSIC_PLAN_UNAVAILABLE:-0}" = 1 ]; then
+      printf 'gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)\n' >&2
+      exit 1
+    fi
     if [ "${FM_TEST_CLASSIC_UNPROTECTED:-0}" = 1 ]; then
       printf 'gh: Branch not protected (HTTP 404)\n' >&2
       exit 1
@@ -101,8 +112,19 @@ case " $* " in
     fi
     cat "$FM_TEST_REQUIREMENTS"
     ;;
-  *"/rules/branches/"*) cat "$FM_TEST_RULES" ;;
+  *"/rules/branches/"*)
+    if [ "${FM_TEST_RULES_PLAN_UNAVAILABLE:-0}" = 1 ]; then
+      printf 'gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)\n' >&2
+      exit 1
+    fi
+    if [ "${FM_TEST_RULES_FORBIDDEN:-0}" = 1 ]; then
+      printf 'gh: Resource not accessible by integration (HTTP 403)\n' >&2
+      exit 1
+    fi
+    cat "$FM_TEST_RULES"
+    ;;
   *"/check-runs?"*)
+    [ -z "${FM_TEST_MUTATE_POLICY:-}" ] || printf ' ' >> "$FM_TEST_MUTATE_POLICY"
     [ -z "${FM_TEST_ABA_MID_HEAD:-}" ] || printf '%s\n' "$FM_TEST_ABA_MID_HEAD" > "$FM_TEST_HEAD"
     cat "$FM_TEST_CHECK_RUNS"
     ;;
@@ -118,8 +140,21 @@ SH
   chmod +x "$dir/fakebin/gh"
 }
 
+run_pr_check() {
+  local dir=$1
+  shift
+  FM_ROOT_OVERRIDE="$dir/root" FM_HOME="$dir/home" \
+    FM_TEST_HEAD="$dir/head" FM_TEST_CHECK_RUNS="$dir/check-runs" \
+    FM_TEST_STATUSES="$dir/statuses" FM_TEST_REQUIREMENTS="$dir/requirements" \
+    FM_TEST_RULES="$dir/rules" FM_TEST_REAL_JQ="$(command -v jq)" \
+    FM_TEST_GH_LOG="$dir/gh.log" FM_PR_CI_ATTEMPTS=1 FM_PR_CI_INTERVAL=0 \
+    PATH="$dir/fakebin:$PATH" \
+    "$PR_CHECK" "$@" 2>&1
+}
+
 run_pr_ci() {
   local dir=$1 expected=$2 real_jq
+  shift 2
   real_jq=$(command -v jq) || return 1
   FM_TEST_HEAD="$dir/head" FM_TEST_CHECK_RUNS="$dir/check-runs" \
     FM_TEST_STATUSES="$dir/statuses" FM_TEST_REQUIREMENTS="$dir/requirements" \
@@ -128,7 +163,170 @@ run_pr_ci() {
     FM_TEST_GH_LOG="$dir/gh.log" \
     PATH="$dir/fakebin:$PATH" \
     "$PR_CI" https://github.com/example/repo/pull/7 "$expected" \
-      --attempts 1 --interval 0 2>&1
+      --attempts 1 --interval 0 "$@" 2>&1
+}
+
+write_private_policy() {
+  local path=$1 repository=${2:-example/repo} base=${3:-main}
+  cat > "$path" <<JSON
+{
+  "version": 1,
+  "id": "example-main-ci-v1",
+  "repository": "$repository",
+  "base": "$base",
+  "required_checks": [
+    {"context": "runtime", "app_id": 15368, "app_slug": "github-actions"},
+    {"context": "webui", "app_id": 15368, "app_slug": "github-actions"}
+  ]
+}
+JSON
+  chmod 0600 "$path"
+}
+
+test_private_plan_policy_contract() {
+  local dir out policy sha status
+  sha=3333333333333333333333333333333333333333
+  dir="$TMP_ROOT/pr-private-policy"
+  policy="$dir/policy.json"
+  make_pr_fixture "$dir" "$sha" '' ''
+  write_private_policy "$policy"
+  printf 'result\tcheck\t%s\truntime\tcompleted\tsuccess\t15368\tgithub-actions\nresult\tcheck\t%s\twebui\tcompleted\tsuccess\t15368\tgithub-actions\n' \
+    "$sha" "$sha" > "$dir/check-runs"
+
+  out=$(FM_TEST_CLASSIC_PLAN_UNAVAILABLE=1 FM_TEST_RULES_PLAN_UNAVAILABLE=1 \
+    run_pr_ci "$dir" "$sha" --required-check-policy "$policy") \
+    || fail "approved private-plan policy rejected exact-head success: $out"
+  assert_contains "$out" "green: https://github.com/example/repo/pull/7 head=$sha checks=2" \
+    "private-plan policy did not verify its declared exact-head checks"
+
+  status=0
+  out=$(FM_TEST_CLASSIC_PLAN_UNAVAILABLE=1 FM_TEST_RULES_PLAN_UNAVAILABLE=1 \
+    run_pr_ci "$dir" "$sha") || status=$?
+  expect_code 1 "$status" "plan-unavailable requirements without an explicit policy must remain unavailable"
+
+  printf '%s\n' '{}' > "$dir/malformed.json"
+  chmod 0600 "$dir/malformed.json"
+  status=0
+  out=$(FM_TEST_CLASSIC_PLAN_UNAVAILABLE=1 FM_TEST_RULES_PLAN_UNAVAILABLE=1 \
+    run_pr_ci "$dir" "$sha" --required-check-policy "$dir/malformed.json") || status=$?
+  expect_code 1 "$status" "a malformed private policy must be refused"
+  assert_contains "$out" "private required-check policy is unavailable, unsafe, or invalid" \
+    "malformed policy refusal was not diagnostic"
+
+  status=0
+  out=$(run_pr_ci "$dir" "$sha" --required-check-policy "$policy") || status=$?
+  expect_code 1 "$status" "an explicit private policy must not replace available server requirements"
+  assert_contains "$out" "required checks are unavailable for base branch main" \
+    "requirement-source switching was not refused"
+
+  status=0
+  out=$(FM_TEST_CLASSIC_FORBIDDEN=1 FM_TEST_RULES_PLAN_UNAVAILABLE=1 \
+    run_pr_ci "$dir" "$sha" --required-check-policy "$policy") || status=$?
+  expect_code 1 "$status" "a generic 403 must not activate a private policy"
+  assert_contains "$out" "required checks are unavailable for base branch main" \
+    "generic permission failure was not kept distinct from plan unavailability"
+
+  status=0
+  out=$(FM_TEST_CLASSIC_PLAN_UNAVAILABLE=1 \
+    run_pr_ci "$dir" "$sha" --required-check-policy "$policy") || status=$?
+  expect_code 1 "$status" "one unavailable requirement endpoint must not activate a private policy"
+
+  write_private_policy "$dir/wrong-repo.json" other/repo main
+  status=0
+  out=$(FM_TEST_CLASSIC_PLAN_UNAVAILABLE=1 FM_TEST_RULES_PLAN_UNAVAILABLE=1 \
+    run_pr_ci "$dir" "$sha" --required-check-policy "$dir/wrong-repo.json") || status=$?
+  expect_code 1 "$status" "a repository-mismatched private policy must be refused"
+  assert_contains "$out" "private required-check policy is unavailable, unsafe, or invalid" \
+    "repository mismatch did not fail at policy validation"
+
+  write_private_policy "$dir/wrong-base.json" example/repo trunk
+  status=0
+  out=$(FM_TEST_CLASSIC_PLAN_UNAVAILABLE=1 FM_TEST_RULES_PLAN_UNAVAILABLE=1 \
+    run_pr_ci "$dir" "$sha" --required-check-policy "$dir/wrong-base.json") || status=$?
+  expect_code 1 "$status" "a base-mismatched private policy must be refused"
+
+  printf 'result\tcheck\t%s\truntime\tcompleted\tsuccess\t99\tgithub-actions\nresult\tcheck\t%s\twebui\tcompleted\tsuccess\t15368\tgithub-actions\n' \
+    "$sha" "$sha" > "$dir/check-runs"
+  status=0
+  out=$(FM_TEST_CLASSIC_PLAN_UNAVAILABLE=1 FM_TEST_RULES_PLAN_UNAVAILABLE=1 \
+    run_pr_ci "$dir" "$sha" --required-check-policy "$policy") || status=$?
+  expect_code 1 "$status" "a policy provider-id mismatch must not be green"
+  assert_contains "$out" "required check provider mismatch: runtime" \
+    "policy provider-id mismatch was not diagnostic"
+
+  printf 'result\tcheck\t%s\truntime\tcompleted\tsuccess\t15368\tother-app\nresult\tcheck\t%s\twebui\tcompleted\tsuccess\t15368\tgithub-actions\n' \
+    "$sha" "$sha" > "$dir/check-runs"
+  status=0
+  out=$(FM_TEST_CLASSIC_PLAN_UNAVAILABLE=1 FM_TEST_RULES_PLAN_UNAVAILABLE=1 \
+    run_pr_ci "$dir" "$sha" --required-check-policy "$policy") || status=$?
+  expect_code 1 "$status" "a policy provider-slug mismatch must not be green"
+  assert_contains "$out" "required check provider mismatch: runtime" \
+    "policy provider-slug mismatch was not diagnostic"
+
+  printf 'result\tcheck\t%s\truntime\tin_progress\tnone\t15368\tgithub-actions\nresult\tcheck\t%s\twebui\tcompleted\tsuccess\t15368\tgithub-actions\n' \
+    "$sha" "$sha" > "$dir/check-runs"
+  status=0
+  out=$(FM_TEST_CLASSIC_PLAN_UNAVAILABLE=1 FM_TEST_RULES_PLAN_UNAVAILABLE=1 \
+    run_pr_ci "$dir" "$sha" --required-check-policy "$policy") || status=$?
+  expect_code 1 "$status" "a pending policy check must not be green"
+  assert_contains "$out" "check is not terminal-successful: runtime" \
+    "pending policy check refusal was not diagnostic"
+
+  printf 'result\tcheck\t%s\truntime\tcompleted\tsuccess\t15368\tgithub-actions\nresult\tcheck\t%s\twebui\tcompleted\tsuccess\t15368\tgithub-actions\n' \
+    "$sha" "$sha" > "$dir/check-runs"
+  status=0
+  out=$(FM_TEST_CLASSIC_PLAN_UNAVAILABLE=1 FM_TEST_RULES_PLAN_UNAVAILABLE=1 \
+    FM_TEST_MUTATE_POLICY="$policy" \
+    run_pr_ci "$dir" "$sha" --required-check-policy "$policy") || status=$?
+  expect_code 1 "$status" "policy bytes changed during a snapshot must be refused"
+  assert_contains "$out" "required checks are unavailable for base branch main" \
+    "policy mutation did not invalidate the requirement snapshot"
+}
+
+test_private_policy_task_continuity() {
+  local dir out policy sha status meta
+  sha=4444444444444444444444444444444444444444
+  dir="$TMP_ROOT/pr-private-policy-task"
+  policy="$dir/policy.json"
+  meta="$dir/home/state/task-a.meta"
+  make_pr_fixture "$dir" "$sha" '' ''
+  write_private_policy "$policy"
+  printf 'window=fixture\nendpoint_task_id=task-a\nworktree=%s\nproject=%s\nkind=ship\nmode=direct-PR\n' \
+    "$dir/wt" "$dir/project" > "$meta"
+  chmod 0600 "$meta"
+  printf 'result\tcheck\t%s\truntime\tcompleted\tsuccess\t15368\tgithub-actions\nresult\tcheck\t%s\twebui\tcompleted\tsuccess\t15368\tgithub-actions\n' \
+    "$sha" "$sha" > "$dir/check-runs"
+
+  out=$(FM_TEST_CLASSIC_PLAN_UNAVAILABLE=1 FM_TEST_RULES_PLAN_UNAVAILABLE=1 \
+    run_pr_check "$dir" task-a https://github.com/example/repo/pull/7 \
+      --required-check-policy "$policy") \
+    || fail "task readiness rejected an approved private policy: $out"
+  grep -qxF "pr_ci_policy_path=$policy" "$meta" \
+    || fail "task readiness did not pin the canonical policy path"
+  grep -Eq '^pr_ci_policy_sha256=[0-9a-f]{64}$' "$meta" \
+    || fail "task readiness did not pin the policy bytes"
+  grep -qxF 'pr_ci_policy_id=example-main-ci-v1' "$meta" \
+    || fail "task readiness did not pin the policy id"
+
+  out=$(FM_TEST_CLASSIC_PLAN_UNAVAILABLE=1 FM_TEST_RULES_PLAN_UNAVAILABLE=1 \
+    run_pr_check "$dir" task-a https://github.com/example/repo/pull/7) \
+    || fail "merge-time readiness did not reuse the recorded policy: $out"
+
+  printf ' ' >> "$policy"
+  status=0
+  out=$(FM_TEST_CLASSIC_PLAN_UNAVAILABLE=1 FM_TEST_RULES_PLAN_UNAVAILABLE=1 \
+    run_pr_check "$dir" task-a https://github.com/example/repo/pull/7) || status=$?
+  expect_code 1 "$status" "changed recorded policy bytes must stop merge-time readiness"
+  assert_contains "$out" "private required-check policy is missing, changed, unsafe, or invalid" \
+    "changed recorded policy did not produce a bounded refusal"
+
+  rm -f "$policy"
+  status=0
+  out=$(FM_TEST_CLASSIC_PLAN_UNAVAILABLE=1 FM_TEST_RULES_PLAN_UNAVAILABLE=1 \
+    run_pr_check "$dir" task-a https://github.com/example/repo/pull/7) || status=$?
+  expect_code 1 "$status" "deleted recorded policy must not return to server requirements"
+  assert_contains "$out" "private required-check policy is missing, changed, unsafe, or invalid" \
+    "deleted recorded policy did not preserve the task's policy requirement"
 }
 
 test_exact_head_green_contract() {
@@ -290,5 +488,7 @@ test_exact_head_green_contract() {
 }
 
 test_canonical_verify_contract
+test_private_plan_policy_contract
+test_private_policy_task_continuity
 test_exact_head_green_contract
 echo "# all bounded direct-PR tests passed"

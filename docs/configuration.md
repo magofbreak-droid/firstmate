@@ -205,6 +205,41 @@ It is not an active delivery mode, bootstrap dependency, CI signature, or merge 
 `bin/fm-verify.sh` is the active canonical local and GitHub Actions gate.
 See [CONTRIBUTING.md](../CONTRIBUTING.md) for targeted and full behavioral validation entry points.
 
+## Private GitHub required-check policy
+
+`bin/fm-pr-check.sh` normally reads required checks only from GitHub branch protection and effective branch rules.
+An operator may explicitly pass `--required-check-policy <absolute-json>` for one private repository whose current GitHub plan makes both requirement APIs return the exact plan-feature-unavailable response.
+The policy never activates for a generic permission error, authentication failure, rate limit, network failure, malformed response, one unavailable endpoint, or an available server requirement source.
+The file must be an ordinary single-link mode-`0600` file at its canonical absolute path and use this complete JSON shape:
+
+```json
+{
+  "version": 1,
+  "id": "example-main-ci-v1",
+  "repository": "example/repository",
+  "base": "main",
+  "required_checks": [
+    {
+      "context": "runtime",
+      "app_id": 15368,
+      "app_slug": "github-actions"
+    }
+  ]
+}
+```
+
+`version` is exactly `1`.
+`id` is a stable 1-128 character identifier containing only ASCII letters, digits, dots, underscores, and hyphens, beginning with a letter or digit.
+`repository` is the exact case-sensitive `<owner>/<repository>` derived from the canonical pull-request URL, and `base` is the exact live pull-request base branch.
+`required_checks` contains 1-64 unique non-empty contexts, each pinned to one positive integer GitHub App id and one GitHub App slug.
+Unknown keys, duplicate contexts, control characters, invalid providers, and repository or base mismatches are rejected.
+
+The initial successful `fm-pr-check.sh` call records the policy's canonical path, SHA-256, and id with the exact pull-request proof.
+Every later readiness check, including the check performed immediately before merge, automatically snapshots and uses the same recorded file identity.
+A removed, replaced, edited, unsafe, or differently identified policy refuses verification instead of returning to the server-policy path.
+The policy replaces only the unavailable requirement list; the helper still requires each declared check to be unique, terminal-successful, provider-matched, and attached to the exact pull-request head observed before and after the evidence snapshot.
+Keep repository-specific policy files under the home's gitignored `config/` directory and never commit them to the shared Firstmate repository.
+
 ## Captain Preferences (data/captain.md / data/captain-shared.md)
 
 Domain-local preferences for one captain's fleet live locally in each home's `data/captain.md`; it is gitignored and printed in the session-start context digest after `data/projects.md` and optional `data/secondmates.md`.

@@ -313,6 +313,7 @@ fm_pr_regular_destination_on_device_or_absent() {
 
 fm_pr_metadata_identity_parse() {
   local file=$1 line value pr_count=0 seen_pr=0 post_pr_invalid=0
+  local policy_path_count=0 policy_hash_count=0 policy_id_count=0
   FM_PR_META_PROVIDER=
   FM_PR_META_URL=
   FM_PR_META_HOST=
@@ -320,6 +321,9 @@ fm_pr_metadata_identity_parse() {
   FM_PR_META_NUMBER=
   FM_PR_META_HEAD=
   FM_PR_META_GREEN_HEAD=
+  FM_PR_META_CI_POLICY_PATH=
+  FM_PR_META_CI_POLICY_HASH=
+  FM_PR_META_CI_POLICY_ID=
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
   [ "$(fm_pr_file_link_count "$file")" = 1 ] || return 1
   while IFS= read -r line || [ -n "$line" ]; do
@@ -353,6 +357,21 @@ fm_pr_metadata_identity_parse() {
           fi
         fi
         ;;
+      pr_ci_policy_path=*)
+        policy_path_count=$((policy_path_count + 1))
+        [ "$seen_pr" -eq 1 ] || post_pr_invalid=1
+        FM_PR_META_CI_POLICY_PATH=${line#pr_ci_policy_path=}
+        ;;
+      pr_ci_policy_sha256=*)
+        policy_hash_count=$((policy_hash_count + 1))
+        [ "$seen_pr" -eq 1 ] || post_pr_invalid=1
+        FM_PR_META_CI_POLICY_HASH=${line#pr_ci_policy_sha256=}
+        ;;
+      pr_ci_policy_id=*)
+        policy_id_count=$((policy_id_count + 1))
+        [ "$seen_pr" -eq 1 ] || post_pr_invalid=1
+        FM_PR_META_CI_POLICY_ID=${line#pr_ci_policy_id=}
+        ;;
       x_request=*|x_request_ts=*|x_followups=*|x_platform=*|x_reply_max_chars=*)
         ;;
       *)
@@ -362,6 +381,22 @@ fm_pr_metadata_identity_parse() {
   done < "$file"
   [ "$pr_count" -eq 1 ] || return 1
   [ "$post_pr_invalid" -eq 0 ] || return 1
+  if [ "$policy_path_count" -ne 0 ] || [ "$policy_hash_count" -ne 0 ] \
+    || [ "$policy_id_count" -ne 0 ]; then
+    [ "$policy_path_count" -eq 1 ] && [ "$policy_hash_count" -eq 1 ] \
+      && [ "$policy_id_count" -eq 1 ] || return 1
+    case "$FM_PR_META_CI_POLICY_PATH" in
+      /*) ;;
+      *) return 1 ;;
+    esac
+    case "$FM_PR_META_CI_POLICY_PATH" in *$'\r'*|*$'\t'*) return 1 ;; esac
+    case "$FM_PR_META_CI_POLICY_HASH" in *[!0-9a-f]*|'') return 1 ;; esac
+    [ "${#FM_PR_META_CI_POLICY_HASH}" -eq 64 ] || return 1
+    case "$FM_PR_META_CI_POLICY_ID" in
+      ''|*[!A-Za-z0-9._-]*|[!A-Za-z0-9]*) return 1 ;;
+    esac
+    [ "${#FM_PR_META_CI_POLICY_ID}" -le 128 ] || return 1
+  fi
   [ -z "$FM_PR_META_GREEN_HEAD" ] || [ "$FM_PR_META_GREEN_HEAD" = "$FM_PR_META_HEAD" ] || return 1
   [ -n "$FM_PR_META_URL" ]
 }

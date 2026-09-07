@@ -6,7 +6,10 @@
 # live only in a private sidecar and are never interpolated into shell source.
 # Active exact-head delivery accepts GitHub pull request URLs only.
 # GitLab URL recognition remains inactive migration compatibility in fm-pr-lib.
-# Usage: fm-pr-check.sh <task-id> <pr-url>
+# An optional private required-check policy is pinned by path, content hash,
+# and policy id in task metadata; every later readiness or merge-time check
+# reuses that exact identity. See docs/configuration.md.
+# Usage: fm-pr-check.sh <task-id> <pr-url> [--required-check-policy <absolute-json>]
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,6 +19,8 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+# shellcheck source=bin/fm-pr-ci-policy-lib.sh
+. "$SCRIPT_DIR/fm-pr-ci-policy-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-wake-lib.sh
@@ -23,12 +28,30 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 # shellcheck source=bin/fm-pr-lifecycle-lock-lib.sh
 . "$SCRIPT_DIR/fm-pr-lifecycle-lock-lib.sh"
 
-if [ "$#" -ne 2 ]; then
+if [ "$#" -lt 2 ]; then
   echo "error: invalid PR check request" >&2
   exit 2
 fi
 ID=$1
 RAW_URL=$2
+shift 2
+POLICY_INPUT=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --required-check-policy)
+      [ "$#" -ge 2 ] && [ -z "$POLICY_INPUT" ] || {
+        echo "error: invalid PR check request" >&2
+        exit 2
+      }
+      POLICY_INPUT=$2
+      shift 2
+      ;;
+    *)
+      echo "error: invalid PR check request" >&2
+      exit 2
+      ;;
+  esac
+done
 if ! fm_pr_task_id_valid "$ID" || ! fm_pr_url_parse "$RAW_URL"; then
   echo "error: invalid PR check request" >&2
   exit 2
@@ -37,6 +60,8 @@ URL=$FM_PR_URL
 PROVIDER=$FM_PR_PROVIDER
 HOST=$FM_PR_HOST
 PROJECT_PATH=$FM_PR_PATH
+OWNER=$FM_PR_OWNER
+REPO=$FM_PR_REPO
 NUMBER=$FM_PR_NUMBER
 
 # Task-derived paths are constructed only after the canonical ID validation.
@@ -54,6 +79,7 @@ if [ "$PROVIDER" != github ]; then
 fi
 
 META_TMP=
+POLICY_SNAPSHOT=
 META_LOCK=
 META_LOCK_HELD=0
 PR_CHECK_LOCK_HELD=0
@@ -69,6 +95,7 @@ pr_check_parent_owns_metadata_lock() {
 pr_check_cleanup() {
   fm_pr_poll_cleanup
   [ -z "$META_TMP" ] || rm -f -- "$META_TMP"
+  [ -z "$POLICY_SNAPSHOT" ] || rm -f -- "$POLICY_SNAPSHOT"
   if [ "$META_LOCK_HELD" = 1 ]; then
     fm_lock_release "$META_LOCK" || true
     META_LOCK_HELD=0
@@ -111,6 +138,47 @@ case "$TASK_MODE" in
     exit 1
     ;;
 esac
+POLICY_META_STATUS=0
+fm_pr_ci_policy_meta_parse "$META" || POLICY_META_STATUS=$?
+case "$POLICY_META_STATUS" in
+  0)
+    POLICY_SOURCE=$FM_PR_CI_META_POLICY_PATH
+    POLICY_EXPECTED_ID=$FM_PR_CI_META_POLICY_ID
+    POLICY_EXPECTED_HASH=$FM_PR_CI_META_POLICY_HASH
+    ;;
+  2)
+    POLICY_SOURCE=$POLICY_INPUT
+    POLICY_EXPECTED_ID=
+    POLICY_EXPECTED_HASH=
+    ;;
+  *)
+    echo "error: recorded private required-check policy identity is malformed" >&2
+    exit 1
+    ;;
+esac
+if [ -n "$POLICY_SOURCE" ]; then
+  fm_pr_ci_policy_snapshot "$POLICY_SOURCE" "$STATE" "$OWNER/$REPO" \
+    "$POLICY_EXPECTED_ID" "$POLICY_EXPECTED_HASH" || {
+    echo "error: private required-check policy is missing, changed, unsafe, or invalid" >&2
+    exit 1
+  }
+  POLICY_SNAPSHOT=$FM_PR_CI_POLICY_SNAPSHOT
+  POLICY_SOURCE=$FM_PR_CI_POLICY_SOURCE_PATH
+  POLICY_SOURCE_IDENTITY=$FM_PR_CI_POLICY_SOURCE_IDENTITY
+  POLICY_ID=$FM_PR_CI_POLICY_ID
+  POLICY_HASH=$FM_PR_CI_POLICY_HASH
+  if [ -n "$POLICY_INPUT" ]; then
+    POLICY_INPUT_REAL=$(realpath "$POLICY_INPUT" 2>/dev/null) || POLICY_INPUT_REAL=
+    [ "$POLICY_INPUT_REAL" = "$POLICY_SOURCE" ] || {
+      echo "error: private required-check policy cannot change after it is recorded" >&2
+      exit 1
+    }
+  fi
+else
+  POLICY_SOURCE_IDENTITY=
+  POLICY_ID=
+  POLICY_HASH=
+fi
 META_PREIMAGE_HASH=$(fm_pr_sha256 "$META") || exit 1
 META_PREIMAGE_IDENTITY=$(fm_pr_file_identity "$META") || exit 1
 
@@ -138,8 +206,19 @@ if ! fm_pr_head_valid "$PR_HEAD"; then
   echo "error: could not resolve the exact GitHub PR head" >&2
   exit 1
 fi
-"$SCRIPT_DIR/fm-pr-ci.sh" "$URL" "$PR_HEAD" \
-  --attempts "${FM_PR_CI_ATTEMPTS:-30}" --interval "${FM_PR_CI_INTERVAL:-10}" || exit 1
+if [ -n "$POLICY_SNAPSHOT" ]; then
+  FM_PR_CI_POLICY_SHA256="$POLICY_HASH" \
+    "$SCRIPT_DIR/fm-pr-ci.sh" "$URL" "$PR_HEAD" \
+      --attempts "${FM_PR_CI_ATTEMPTS:-30}" --interval "${FM_PR_CI_INTERVAL:-10}" \
+      --required-check-policy "$POLICY_SNAPSHOT" || exit 1
+  fm_pr_ci_policy_source_unchanged "$POLICY_SOURCE" "$POLICY_SOURCE_IDENTITY" "$POLICY_HASH" || {
+    echo "error: private required-check policy changed during exact-head verification" >&2
+    exit 1
+  }
+else
+  "$SCRIPT_DIR/fm-pr-ci.sh" "$URL" "$PR_HEAD" \
+    --attempts "${FM_PR_CI_ATTEMPTS:-30}" --interval "${FM_PR_CI_INTERVAL:-10}" || exit 1
+fi
 
 fm_pr_poll_prepare "$STATE" "$ID" "$PROVIDER" "$URL" "$HOST" "$PROJECT_PATH" "$NUMBER" "$PR_HEAD" "$SCRIPT_DIR/fm-pr-poll.sh" \
   || { echo "error: could not prepare PR poll" >&2; exit 1; }
@@ -171,13 +250,22 @@ STATE_DEVICE=$(fm_pr_file_device "$STATE") || exit 1
 META_TMP=$(mktemp "$STATE/.fm-pr-meta.XXXXXX") || exit 1
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in
-    pr=*|pr_head=*|pr_green_head=*) ;;
+    pr=*|pr_head=*|pr_green_head=*|pr_ci_policy_path=*|pr_ci_policy_sha256=*|pr_ci_policy_id=*) ;;
     *) printf '%s\n' "$line" >> "$META_TMP" || exit 1 ;;
   esac
 done < "$META"
 printf 'pr=%s\n' "$URL" >> "$META_TMP" || exit 1
 printf 'pr_head=%s\n' "$PR_HEAD" >> "$META_TMP" || exit 1
 printf 'pr_green_head=%s\n' "$PR_HEAD" >> "$META_TMP" || exit 1
+if [ -n "$POLICY_SNAPSHOT" ]; then
+  fm_pr_ci_policy_source_unchanged "$POLICY_SOURCE" "$POLICY_SOURCE_IDENTITY" "$POLICY_HASH" || {
+    echo "error: private required-check policy changed before its identity was recorded" >&2
+    exit 1
+  }
+  printf 'pr_ci_policy_path=%s\n' "$POLICY_SOURCE" >> "$META_TMP" || exit 1
+  printf 'pr_ci_policy_sha256=%s\n' "$POLICY_HASH" >> "$META_TMP" || exit 1
+  printf 'pr_ci_policy_id=%s\n' "$POLICY_ID" >> "$META_TMP" || exit 1
+fi
 chmod 0600 "$META_TMP" || exit 1
 fm_pr_private_file_valid "$META_TMP" 600 "$STATE_DEVICE" || exit 1
 fm_pr_metadata_identity_parse "$META_TMP" || exit 1

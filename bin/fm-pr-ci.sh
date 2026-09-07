@@ -96,8 +96,9 @@ base_valid() {
 }
 
 read_classic_required_checks() {
-  local base_path response status=0
+  local base_path response error_file error status=0
   base_path=$(fm_pr_urlencode_path_segment "$1") || return 1
+  error_file=$(mktemp "${TMPDIR:-/tmp}/fm-pr-ci-classic.XXXXXX") || return 1
   # shellcheck disable=SC2016
   response=$(gh api -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' \
@@ -122,19 +123,25 @@ read_classic_required_checks() {
          (if .app_id == -1 then "any" else (.app_id | tostring) end), "none"] |
         @tsv
       end
-    ' 2>&1) || status=$?
+    ' 2>"$error_file") || status=$?
+  error=$(cat "$error_file") || {
+    rm -f -- "$error_file"
+    return 1
+  }
+  rm -f -- "$error_file"
   if [ "$status" -eq 0 ]; then
     printf '%s\n' "$response"
     return 0
   fi
-  [ "$response" = 'gh: Branch not protected (HTTP 404)' ] && return 0
-  [ "$response" = "$PLAN_FEATURE_UNAVAILABLE" ] && return 20
+  [ "$error" = 'gh: Branch not protected (HTTP 404)' ] && return 0
+  [ "$error" = "$PLAN_FEATURE_UNAVAILABLE" ] && return 20
   return 1
 }
 
 read_ruleset_required_checks() {
-  local base_path response status=0
+  local base_path response error_file error status=0
   base_path=$(fm_pr_urlencode_path_segment "$1") || return 1
+  error_file=$(mktemp "${TMPDIR:-/tmp}/fm-pr-ci-rules.XXXXXX") || return 1
   # shellcheck disable=SC2016
   response=$(gh api --paginate -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' \
@@ -164,12 +171,17 @@ read_ruleset_required_checks() {
           @tsv
         end
       end
-    ' 2>&1) || status=$?
+    ' 2>"$error_file") || status=$?
+  error=$(cat "$error_file") || {
+    rm -f -- "$error_file"
+    return 1
+  }
+  rm -f -- "$error_file"
   if [ "$status" -eq 0 ]; then
     printf '%s\n' "$response"
     return 0
   fi
-  [ "$response" = "$PLAN_FEATURE_UNAVAILABLE" ] && return 20
+  [ "$error" = "$PLAN_FEATURE_UNAVAILABLE" ] && return 20
   return 1
 }
 
